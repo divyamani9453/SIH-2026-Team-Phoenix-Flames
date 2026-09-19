@@ -305,20 +305,6 @@ def fill_synthetic_weather(dataframe):
     return dataframe
 
 
-def enrich_derived_columns(dataframe):
-    """Stress categories + mortality indices (depends on UTCI columns)."""
-    for d in range(4):
-        dataframe[f"Stress Category_d{d}"] = dataframe[f"UTCI_d{d}"].apply(
-            utci_stress_category
-        )
-        f_vals = dataframe[f"UTCI_d{d}"].apply(calculate_f_utci)
-        for demo, weight in DEMO_WEIGHTS.items():
-            dataframe[f"Mortality_{demo}_d{d}"] = (
-                f_vals * weight * 50
-            ).round(1).clip(upper=100.0)
-    return dataframe
-
-
 import math
 
 # ==============================================================================
@@ -654,9 +640,34 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
+            /* --- GLASSMORPHISM & ENTERPRISE UI STYLES --- */
+            .glass-card {
+                border-radius: 16px !important;
+                transition: transform 0.25s ease, box-shadow 0.25s ease !important;
+            }
+            .glass-card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 12px 28px rgba(0, 0, 0, 0.12) !important;
+            }
+            .brand-header-banner {
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 60%, #1e3a8a 100%) !important;
+                border-radius: 16px;
+                color: #ffffff !important;
+                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+            }
+            .brand-header-banner p {
+                color: #94a3b8 !important;
+            }
+            .metric-pill {
+                border-radius: 12px;
+                padding: 12px 16px;
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+
             /* --- LIGHT MODE CONTRAST ENHANCEMENTS --- */
             .light-mode {
-                background-color: #f8fafc !important;
+                background: linear-gradient(180deg, #f1f5f9 0%, #f8fafc 100%) !important;
                 color: #0f172a !important;
             }
             .light-mode .text-muted {
@@ -667,14 +678,18 @@ app.index_string = '''
                 font-weight: 600;
             }
             .light-mode .card {
-                background-color: #ffffff !important;
+                background-color: rgba(255, 255, 255, 0.9) !important;
+                backdrop-filter: blur(12px) !important;
                 border: 1px solid #cbd5e1 !important;
                 color: #0f172a !important;
+                border-radius: 16px !important;
             }
             .light-mode .card-header {
-                background-color: #ffffff !important;
+                background-color: rgba(255, 255, 255, 0.95) !important;
                 border-bottom: 1px solid #e2e8f0 !important;
                 color: #0f172a !important;
+                border-top-left-radius: 16px !important;
+                border-top-right-radius: 16px !important;
             }
 
             /* Light Mode Range Sliders & Tooltips */
@@ -868,11 +883,14 @@ app.layout = dbc.Container([
     dcc.Interval(id="status-poll-interval", interval=12 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
 
-    # --- HEADER & THEME TOGGLE ---
+    # --- HEADER & THEME TOGGLE BANNER ---
     dbc.Row([
         dbc.Col([
-            html.H2("India Thermal Comfort & Mortality Risk Platform", className="fw-bolder mb-1"),
-            html.P("Predictive biometeorological forecasting & localized demographic risk assessment", className="text-muted mb-0")
+            html.Div([
+                html.Span("🇮🇳 SIH 2026 PS 83 • OFFICIAL PROTOTYPE", className="badge bg-danger text-light px-3 py-1 mb-2 fw-bold text-uppercase rounded-pill shadow-sm"),
+                html.H2("India Thermal Comfort & Mortality Risk Platform", className="fw-bolder mb-1 text-white"),
+                html.P("Predictive biometeorological forecasting & localized demographic risk assessment engine", className="mb-0 text-light opacity-75")
+            ])
         ], md=6),
         dbc.Col([
             dbc.Button(
@@ -880,22 +898,22 @@ app.layout = dbc.Container([
                 id="btn-open-alert-modal",
                 color="warning",
                 size="sm",
-                className="me-2 fw-bold text-dark shadow-sm",
+                className="me-2 fw-bold text-dark shadow-sm rounded-pill px-3 py-2",
                 n_clicks=0,
             ),
             html.Span(id="live-status-badge", className="me-2"),
             dbc.Button(
                 "↻ Update data",
                 id="btn-update-data",
-                color="primary",
+                color="light",
                 outline=True,
                 size="sm",
-                className="me-2 fw-bold",
+                className="me-2 fw-bold rounded-pill px-3 py-2",
                 n_clicks=0,
             ),
-            dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block")
+            dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block text-light ms-2")
         ], md=6, className="d-flex justify-content-md-end align-items-center mt-3 mt-md-0")
-    ], className="my-4 py-3 border-bottom"),
+    ], className="brand-header-banner p-4 my-3 align-items-center"),
     html.Div(id="update-feedback", className="small text-muted mb-2"),
 
     # --- ALERT DISPATCH MODAL ---
@@ -1194,8 +1212,10 @@ def update_kpis(horizon, dark_mode, _version):
     utci_col = f"UTCI_d{horizon}"
     temp_col = f"Dry Bulb Temp_d{horizon}"
     
-    valid = df.dropna(subset=[temp_col])
-    avg_u = round(df[utci_col].mean(), 1) if not df[utci_col].empty else "N/A"
+    # Exclude municipal wards for national district KPIs
+    district_df = df[df["State"] != "Municipal Wards"]
+    valid = district_df.dropna(subset=[temp_col])
+    avg_u = round(district_df[utci_col].mean(), 1) if not district_df[utci_col].empty else "N/A"
     max_r = valid.loc[valid[temp_col].idxmax()] if not valid.empty else None
     min_r = valid.loc[valid[temp_col].idxmin()] if not valid.empty else None
 
@@ -1227,7 +1247,7 @@ def update_kpis(horizon, dark_mode, _version):
         ]),
         dbc.Col([
             html.Div("Monitored Districts", className="text-muted small fw-bold text-uppercase"),
-            html.Div(f"{len(df)}", className="fs-3 fw-bolder", style={"color": dist_color})
+            html.Div(f"{len(district_df)}", className="fs-3 fw-bolder", style={"color": dist_color})
         ])
     ])
 
@@ -1281,13 +1301,15 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
 
-    fig = px.choropleth_map(
+    fig = px.choropleth(
         data_frame=filtered_df, color=target_col, range_color=r_use,
-        geojson=active_geojson, opacity=0.75, zoom=map_zoom,
-        featureidkey="properties.join_key", map_style=map_style,
-        center={"lat": center_lat, "lon": center_lon}, height=550, locations="join_key"
+        geojson=active_geojson,
+        featureidkey="properties.join_key", locations="join_key",
+        projection="mercator"
     )
-    fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig.update_traces(marker_opacity=0.85)
+    fig.update_geos(fitbounds="locations", visible=True, showcoastlines=True, coastlinecolor="gray", showland=True, landcolor="#1e293b" if dark_mode else "#f8fafc")
+    fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=550, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     return fig
 
 @callback(
@@ -1332,14 +1354,16 @@ def update_mortality_map(demo_class, selected_state, horizon, mortality_range, d
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
 
-    fig = px.choropleth_map(
+    fig = px.choropleth(
         data_frame=filtered_df, color=target_col, range_color=r_use,
-        geojson=active_geojson, color_continuous_scale="Reds", opacity=0.8,
-        zoom=map_zoom, featureidkey="properties.join_key", map_style=map_style,
-        center={"lat": center_lat, "lon": center_lon}, height=500, locations="join_key",
+        geojson=active_geojson, color_continuous_scale="Reds",
+        featureidkey="properties.join_key", locations="join_key",
+        projection="mercator",
         labels={target_col: "Mortality Risk Index"}
     )
-    fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig.update_traces(marker_opacity=0.85)
+    fig.update_geos(fitbounds="locations", visible=True, showcoastlines=True, coastlinecolor="gray", showland=True, landcolor="#1e293b" if dark_mode else "#f8fafc")
+    fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=500, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     return fig
 
 @callback(Output('district-search', 'value'), Input('district-map', 'clickData'))
