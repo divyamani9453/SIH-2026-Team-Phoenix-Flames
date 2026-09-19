@@ -10,3 +10,5 @@ openmeteo-requests
 requests-cache
 retry-requests
 openpyxl
+scikit-learn
+joblib
