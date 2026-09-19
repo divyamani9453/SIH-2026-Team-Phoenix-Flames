@@ -15,15 +15,10 @@ from pythermalcomfort.models import utci
 # ==============================================================================
 # DATA INGESTION & PROCESSING
 # ==============================================================================
-# Pre-computed centroids (lat/lon) live in a tiny Excel file so the server
-# never has to parse geometry just to get district centres.
-# Use the heavily simplified GeoJSON (~2.7 MB on disk, ~5 MB in RAM) so the
-# process stays well under Render's 512 MB limit.
 CENTROIDS_FILE = os.environ.get("CENTROIDS_FILE", "district_centroids.xlsx")
 GEOJSON_FILE = os.environ.get("GEOJSON_FILE", "India-Districts-slim.json")
 
 df = pd.read_excel(CENTROIDS_FILE)
-# Ensure required columns exist
 required = {"join_key", "District", "State", "lat", "lon"}
 missing = required - set(df.columns)
 if missing:
@@ -32,11 +27,61 @@ if missing:
 with open(GEOJSON_FILE) as f:
     district_geojson = json.load(f)
 
-# join_key is already present in the slim GeoJSON; defensive pass for other files.
 for feature in district_geojson["features"]:
     props = feature["properties"]
     if "join_key" not in props:
         props["join_key"] = f"{props.get('ST_NM','')}|{props.get('DISTRICT','')}"
+
+# Load Municipal Ward GeoJSONs lazily to preserve low memory footprint (<150 MB)
+WARD_FILES = {
+    "AHMEDABAD_WARDS": "data/municipal_wards/ahmedabad_wards.geojson",
+    "BANGALORE_WARDS": "data/municipal_wards/bangalore_wards.geojson",
+}
+ward_geojsons = {}
+ward_dfs = {}
+
+for ward_key, filepath in WARD_FILES.items():
+    if os.path.exists(filepath):
+        try:
+            with open(filepath) as wf:
+                w_json = json.load(wf)
+
+            w_rows = []
+            for idx, feature in enumerate(w_json["features"]):
+                props = feature["properties"]
+                # Normalize ward name key
+                w_name = props.get("Name") or props.get("KGISWardName") or f"Ward {idx+1}"
+                j_key = f"{ward_key}|{w_name}"
+                props["join_key"] = j_key
+
+                # Approximate polygon centroid lat/lon
+                coords = feature.get("geometry", {}).get("coordinates", [])
+                if coords:
+                    try:
+                        pts = coords[0] if feature["geometry"]["type"] == "Polygon" else coords[0][0]
+                        lons = [p[0] for p in pts if len(p) >= 2]
+                        lats = [p[1] for p in pts if len(p) >= 2]
+                        c_lon = float(np.mean(lons))
+                        c_lat = float(np.mean(lats))
+                    except Exception:
+                        c_lat, c_lon = (23.0225, 72.5714) if "AHMEDABAD" in ward_key else (12.9716, 77.5946)
+                else:
+                    c_lat, c_lon = (23.0225, 72.5714) if "AHMEDABAD" in ward_key else (12.9716, 77.5946)
+
+                w_rows.append({
+                    "join_key": j_key,
+                    "District": w_name,
+                    "State": "Municipal Wards",
+                    "lat": c_lat,
+                    "lon": c_lon,
+                })
+
+            w_df = pd.DataFrame(w_rows)
+            ward_geojsons[ward_key] = w_json
+            ward_dfs[ward_key] = w_df
+            print(f"[ward-gis] Loaded {ward_key} ({len(w_rows)} wards)", flush=True)
+        except Exception as e:
+            print(f"[ward-gis] Failed to load {ward_key}: {e}", flush=True)
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 # Conservative batching for shared cloud IPs (Render free tier)
@@ -436,8 +481,23 @@ DEFAULT_SLIDER_BOUNDS = {
     "Relative Humidity (%)": [0, 100],
 }
 states_list = sorted(df["State"].unique().tolist())
+if "AHMEDABAD_WARDS" in ward_dfs:
+    states_list.append("📍 Municipal Wards: Ahmedabad (48 Wards)")
+if "BANGALORE_WARDS" in ward_dfs:
+    states_list.append("📍 Municipal Wards: Bengaluru (243 Wards)")
+
+# Combine district and ward datasets into global working dataframe
+combined_df_list = [df]
+for w_key, w_df in ward_dfs.items():
+    combined_df_list.append(w_df)
+
+full_df = pd.concat(combined_df_list, ignore_index=True)
+full_df = fill_synthetic_weather(full_df)
+full_df = enrich_derived_columns(full_df)
+df = full_df
+
 district_options = [
-    {"label": f"{r['District']}, {r['State']}", "value": r["join_key"]}
+    {"label": f"{r['District']} ({r['State']})", "value": r["join_key"]}
     for _, r in df.iterrows()
 ]
 
@@ -1196,17 +1256,36 @@ def update_slider_limits(measurement_chosen, horizon):
 )
 def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode, _version):
     target_col = f"{MEASUREMENTS[measurement_chosen]}_d{horizon}"
-    filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
     r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS[measurement_chosen]
+
+    # Handle Municipal Ward Layer vs District Layer
+    if "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
+        active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
+        filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
+        center_lat, center_lon, map_zoom = 23.0225, 72.5714, 10.5
+    elif "Bengaluru" in selected_state and "BANGALORE_WARDS" in ward_geojsons:
+        active_geojson = ward_geojsons["BANGALORE_WARDS"]
+        filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
+        center_lat, center_lon, map_zoom = 12.9716, 77.5946, 10.2
+    elif selected_state == "ALL":
+        active_geojson = district_geojson
+        filtered_df = df[~df["State"].isin(["Municipal Wards"])]
+        center_lat, center_lon, map_zoom = 22.5, 80.0, 3.4
+    else:
+        active_geojson = district_geojson
+        filtered_df = df[df['State'] == selected_state]
+        center_lat = float(filtered_df["lat"].mean()) if not filtered_df.empty else 22.5
+        center_lon = float(filtered_df["lon"].mean()) if not filtered_df.empty else 80.0
+        map_zoom = 5.5
 
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
 
     fig = px.choropleth_map(
         data_frame=filtered_df, color=target_col, range_color=r_use,
-        geojson=district_geojson, opacity=0.7, zoom=3.4,
+        geojson=active_geojson, opacity=0.75, zoom=map_zoom,
         featureidkey="properties.join_key", map_style=map_style,
-        center={"lat": 22.5, "lon": 80.0}, height=550, locations="join_key"
+        center={"lat": center_lat, "lon": center_lon}, height=550, locations="join_key"
     )
     fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     return fig
@@ -1220,7 +1299,26 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
 )
 def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode, _version):
     target_col = f"Mortality_{demo_class}_d{horizon}"
-    filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
+
+    # Handle Municipal Ward Layer vs District Layer
+    if "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
+        active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
+        filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
+        center_lat, center_lon, map_zoom = 23.0225, 72.5714, 10.5
+    elif "Bengaluru" in selected_state and "BANGALORE_WARDS" in ward_geojsons:
+        active_geojson = ward_geojsons["BANGALORE_WARDS"]
+        filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
+        center_lat, center_lon, map_zoom = 12.9716, 77.5946, 10.2
+    elif selected_state == "ALL":
+        active_geojson = district_geojson
+        filtered_df = df[~df["State"].isin(["Municipal Wards"])]
+        center_lat, center_lon, map_zoom = 22.5, 80.0, 3.4
+    else:
+        active_geojson = district_geojson
+        filtered_df = df[df['State'] == selected_state]
+        center_lat = float(filtered_df["lat"].mean()) if not filtered_df.empty else 22.5
+        center_lon = float(filtered_df["lon"].mean()) if not filtered_df.empty else 80.0
+        map_zoom = 5.5
 
     if mortality_range:
         filtered_df = filtered_df[
@@ -1236,9 +1334,9 @@ def update_mortality_map(demo_class, selected_state, horizon, mortality_range, d
 
     fig = px.choropleth_map(
         data_frame=filtered_df, color=target_col, range_color=r_use,
-        geojson=district_geojson, color_continuous_scale="Reds", opacity=0.8,
-        zoom=3.4, featureidkey="properties.join_key", map_style=map_style,
-        center={"lat": 22.5, "lon": 80.0}, height=500, locations="join_key",
+        geojson=active_geojson, color_continuous_scale="Reds", opacity=0.8,
+        zoom=map_zoom, featureidkey="properties.join_key", map_style=map_style,
+        center={"lat": center_lat, "lon": center_lon}, height=500, locations="join_key",
         labels={target_col: "Mortality Risk Index"}
     )
     fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
