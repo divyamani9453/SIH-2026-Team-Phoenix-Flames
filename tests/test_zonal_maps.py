@@ -6,8 +6,8 @@ import app
 def test_all_states_map_generation_synthetic():
     """Verify that every state and municipal ward zonal view renders non-empty map traces."""
     for state in app.states_list:
-        fig_thermal = app.update_thermal_map('UTCI (deg C)', state, [15, 45], 0, False, 'init')
-        fig_mort = app.update_mortality_map('Elderly (60+ yrs)', state, 0, [0, 100], False, 'init')
+        fig_thermal = app.update_thermal_map('UTCI (deg C)', state, None, [15, 45], 0, False, 'init')
+        fig_mort = app.update_mortality_map('Elderly (60+ yrs)', state, None, 0, [0, 100], False, 'init')
 
         assert len(fig_thermal.data) > 0, f"No data trace in thermal map for state: {state}"
         assert len(fig_mort.data) > 0, f"No data trace in mortality map for state: {state}"
@@ -38,8 +38,8 @@ def test_real_data_enrichment_map_generation():
     working = app.enrich_derived_columns(working)
 
     for state in ['ALL', 'Gujarat', 'Municipal Wards: Ahmedabad (48 Wards)']:
-        fig_thermal = app.update_thermal_map('UTCI (deg C)', state, [15, 45], 0, False, 'init')
-        fig_mort = app.update_mortality_map('Elderly (60+ yrs)', state, 0, [0, 100], False, 'init')
+        fig_thermal = app.update_thermal_map('UTCI (deg C)', state, None, [15, 45], 0, False, 'init')
+        fig_mort = app.update_mortality_map('Elderly (60+ yrs)', state, None, 0, [0, 100], False, 'init')
 
         assert len(fig_thermal.data[0].locations) > 0
         assert len(fig_mort.data[0].locations) > 0
