@@ -121,6 +121,9 @@ def _load_weather_cache(dataframe, max_age_hours=None):
         cache_df = pd.read_pickle(WEATHER_CACHE_FILE)
         if "join_key" not in cache_df.columns:
             return False
+        if not set(dataframe["join_key"]).issubset(set(cache_df["join_key"])):
+            print(f"[weather] Cache invalid (missing keys for some locations)", flush=True)
+            return False
         merged = dataframe.drop(
             columns=[c for c in dataframe.columns if c in cache_df.columns and c != "join_key"],
             errors="ignore",
@@ -506,7 +509,14 @@ def _run_one_weather_fetch(force=False):
         working = df.copy()
 
         if not force and _load_weather_cache(working):
-            df = enrich_derived_columns(working)
+            working = enrich_derived_columns(working)
+            for d_idx in range(4):
+                try:
+                    scores, _ = get_hvi_predictions_and_features(working, horizon=d_idx)
+                    working[f"AI HVI_d{d_idx}"] = scores
+                except Exception as e:
+                    print(f"[ml-hvi] Error generating HVI for horizon d{d_idx}: {e}", flush=True)
+            df = working
             _weather_ready = True
             _weather_source = "cache"
             _last_weather_update = datetime.fromtimestamp(
@@ -516,6 +526,12 @@ def _run_one_weather_fetch(force=False):
 
         updated = fetch_multi_day_weather(working)
         updated = enrich_derived_columns(updated)
+        for d_idx in range(4):
+            try:
+                scores, _ = get_hvi_predictions_and_features(updated, horizon=d_idx)
+                updated[f"AI HVI_d{d_idx}"] = scores
+            except Exception as e:
+                print(f"[ml-hvi] Error generating HVI for horizon d{d_idx}: {e}", flush=True)
         df = updated
         aborted = bool(getattr(updated, "attrs", {}).get("weather_aborted", False))
         n_ok = int(getattr(updated, "attrs", {}).get("weather_ok_locations", 0) or 0)
@@ -531,7 +547,14 @@ def _run_one_weather_fetch(force=False):
         _wlog(f"[weather] Fetch failed: {e}")
         working = df.copy()
         if _load_weather_cache(working, max_age_hours=72):
-            df = enrich_derived_columns(working)
+            working = enrich_derived_columns(working)
+            for d_idx in range(4):
+                try:
+                    scores, _ = get_hvi_predictions_and_features(working, horizon=d_idx)
+                    working[f"AI HVI_d{d_idx}"] = scores
+                except Exception as e:
+                    print(f"[ml-hvi] Error generating HVI for horizon d{d_idx}: {e}", flush=True)
+            df = working
             _weather_source = "cache"
         else:
             _weather_source = "synthetic"
@@ -1452,7 +1475,14 @@ def update_ai_insights(horizon, searched_district, dark_mode, _version):
 )
 def update_stress_chart(selected_state, horizon, dark_mode, _version):
     target_col = f"Stress Category_d{horizon}"
-    filtered_df = df if selected_state == "ALL" else df[df['State'] == selected_state]
+    if "Ahmedabad" in selected_state:
+        filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
+    elif "Bengaluru" in selected_state:
+        filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
+    elif selected_state == "ALL":
+        filtered_df = df[~df["State"].isin(["Municipal Wards"])]
+    else:
+        filtered_df = df[df['State'] == selected_state]
     counts = filtered_df[target_col].value_counts().reset_index()
     counts.columns = ['Category', 'Count']
     
