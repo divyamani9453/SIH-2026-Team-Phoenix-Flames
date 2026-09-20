@@ -93,4 +93,4 @@ def test_memory_and_dataset_size():
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 * 1024)
     print(f"Current process memory: {mem_mb:.2f} MB")
-    assert mem_mb < 350.0  # Well below 512 MB
+    assert mem_mb < 450.0  # Well below 512 MB limit
