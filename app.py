@@ -8,7 +8,10 @@ import requests
 import urllib.parse
 import json
 import time
-from functools import lru_cache
+import math
+import threading
+import sys
+from datetime import datetime, timezone
 
 from pythermalcomfort.models import utci
 from src.ml_engine import get_hvi_predictions_and_features
@@ -16,15 +19,15 @@ from src.ml_engine import get_hvi_predictions_and_features
 # ==============================================================================
 # DATA INGESTION & PROCESSING
 # ==============================================================================
-CENTROIDS_FILE = os.environ.get("CENTROIDS_FILE", "district_centroids.xlsx")
-GEOJSON_FILE = os.environ.get("GEOJSON_FILE", "India-Districts-slim.json")
+CENTROIDS_FILE = os.environ.get("CENTROIDS_FILE", "data/geo/district_centroids.xlsx")
+GEOJSON_FILE = os.environ.get("GEOJSON_FILE", "data/geo/India-Districts-slim.json")
 SPATIAL_FEATURES_FILE = os.environ.get("SPATIAL_FEATURES_FILE", "data/spatial_features.csv")
 
 df = pd.read_excel(CENTROIDS_FILE)
 required = {"join_key", "District", "State", "lat", "lon"}
 missing = required - set(df.columns)
 if missing:
-    raise ValueError(f"Centroids Excel missing columns: {missing}")
+    raise ValueError(f"Centroids Excel missing required columns: {missing}")
 
 with open(GEOJSON_FILE) as f:
     district_geojson = json.load(f)
@@ -34,7 +37,7 @@ for feature in district_geojson["features"]:
     if "join_key" not in props:
         props["join_key"] = f"{props.get('ST_NM','')}|{props.get('DISTRICT','')}"
 
-# Load Municipal Ward GeoJSONs lazily to preserve low memory footprint (<150 MB)
+# Load Municipal Ward GeoJSONs lazily to maintain low memory footprint (<150 MB)
 WARD_FILES = {
     "AHMEDABAD_WARDS": "data/municipal_wards/ahmedabad_wards.geojson",
     "BANGALORE_WARDS": "data/municipal_wards/bangalore_wards.geojson",
@@ -51,12 +54,10 @@ for ward_key, filepath in WARD_FILES.items():
             w_rows = []
             for idx, feature in enumerate(w_json["features"]):
                 props = feature["properties"]
-                # Normalize ward name key
                 w_name = props.get("Name") or props.get("KGISWardName") or f"Ward {idx+1}"
                 j_key = f"{ward_key}|{w_name}"
                 props["join_key"] = j_key
 
-                # Approximate polygon centroid lat/lon
                 coords = feature.get("geometry", {}).get("coordinates", [])
                 if coords:
                     try:
@@ -86,17 +87,14 @@ for ward_key, filepath in WARD_FILES.items():
             print(f"[ward-gis] Failed to load {ward_key}: {e}", flush=True)
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-# Conservative batching for shared cloud IPs (Render free tier)
 BATCH_SIZE = 40
 BATCH_PAUSE_SEC = 1.5
-# Hard cap so cold starts never sit on "Updating…" for many minutes
 FETCH_MAX_SECONDS = int(os.environ.get("FETCH_MAX_SECONDS", "90"))
 WEATHER_CACHE_FILE = os.environ.get("WEATHER_CACHE_FILE", "weather_cache.pkl")
 CACHE_MAX_AGE_HOURS = float(os.environ.get("CACHE_MAX_AGE_HOURS", "6"))
 
 
 def _save_weather_cache(dataframe):
-    """Persist weather columns (lost on Render free spin-down; helps while instance is warm)."""
     try:
         cols = [c for c in dataframe.columns if any(
             c.startswith(p) for p in (
@@ -106,9 +104,9 @@ def _save_weather_cache(dataframe):
             )
         )]
         dataframe[["join_key"] + cols].to_pickle(WEATHER_CACHE_FILE)
-        print(f"[weather] cache saved → {WEATHER_CACHE_FILE}", flush=True)
+        print(f"[weather] Cache saved to {WEATHER_CACHE_FILE}", flush=True)
     except Exception as e:
-        print(f"[weather] cache save failed: {e}", flush=True)
+        print(f"[weather] Cache save failed: {e}", flush=True)
 
 
 def _load_weather_cache(dataframe, max_age_hours=None):
@@ -118,7 +116,7 @@ def _load_weather_cache(dataframe, max_age_hours=None):
         age_h = (time.time() - os.path.getmtime(WEATHER_CACHE_FILE)) / 3600.0
         limit = CACHE_MAX_AGE_HOURS if max_age_hours is None else max_age_hours
         if age_h > limit:
-            print(f"[weather] cache too old ({age_h:.1f}h > {limit}h)", flush=True)
+            print(f"[weather] Cache expired ({age_h:.1f}h > {limit}h)", flush=True)
             return False
         cache_df = pd.read_pickle(WEATHER_CACHE_FILE)
         if "join_key" not in cache_df.columns:
@@ -130,18 +128,14 @@ def _load_weather_cache(dataframe, max_age_hours=None):
         for c in cache_df.columns:
             if c != "join_key":
                 dataframe[c] = merged[c].values
-        print(f"[weather] cache loaded (age {age_h:.1f}h)", flush=True)
+        print(f"[weather] Disk cache loaded successfully (age: {age_h:.1f}h)", flush=True)
         return True
     except Exception as e:
-        print(f"[weather] cache load failed: {e}", flush=True)
+        print(f"[weather] Cache load failed: {e}", flush=True)
         return False
 
 
 def fetch_batch(lats, lons):
-    """Fetch one batch. Returns (list, hit_rate_limit).
-
-    On 429: one short wait then give up — do NOT sleep for minutes (that stuck the UI).
-    """
     params = {
         "latitude": ",".join(f"{x:.4f}" for x in lats),
         "longitude": ",".join(f"{x:.4f}" for x in lons),
@@ -155,10 +149,8 @@ def fetch_batch(lats, lons):
             res = requests.get(OPEN_METEO_URL, params=params, timeout=45)
             if res.status_code == 429:
                 if attempt == 0:
-                    print("[weather] rate-limited (429), brief pause 8s then retry once…", flush=True)
                     time.sleep(8)
                     continue
-                print("[weather] still rate-limited — skipping batch", flush=True)
                 return [None] * len(lats), True
             res.raise_for_status()
             data = res.json()
@@ -170,7 +162,7 @@ def fetch_batch(lats, lons):
                 return [data], False
             return [None] * len(lats), False
         except Exception as e:
-            print(f"[weather] batch error: {e}", flush=True)
+            print(f"[weather] Batch error: {e}", flush=True)
             if attempt == 0:
                 time.sleep(3)
                 continue
@@ -179,7 +171,6 @@ def fetch_batch(lats, lons):
 
 
 def fetch_multi_day_weather(dataframe):
-    """Fetch all districts with a hard wall-clock limit (default 90s)."""
     lats, lons = dataframe["lat"].tolist(), dataframe["lon"].tolist()
     all_responses = []
     n_batches = (len(dataframe) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -189,7 +180,6 @@ def fetch_multi_day_weather(dataframe):
 
     for bi, i in enumerate(range(0, len(dataframe), BATCH_SIZE)):
         if time.time() - t0 > FETCH_MAX_SECONDS:
-            print(f"[weather] hit {FETCH_MAX_SECONDS}s time budget — stopping early", flush=True)
             remaining = len(dataframe) - len(all_responses)
             all_responses.extend([None] * remaining)
             aborted = True
@@ -197,14 +187,12 @@ def fetch_multi_day_weather(dataframe):
 
         b_lats = lats[i:i + BATCH_SIZE]
         b_lons = lons[i:i + BATCH_SIZE]
-        print(f"[weather] batch {bi + 1}/{n_batches} ({len(b_lats)} locations)…", flush=True)
         batch_res, hit_limit = fetch_batch(b_lats, b_lons)
 
         if hit_limit:
             consecutive_rate_limits += 1
             all_responses.extend([None] * len(b_lats))
             if consecutive_rate_limits >= 2:
-                print("[weather] repeated 429s — aborting (use synthetic / try Update later)", flush=True)
                 remaining = len(dataframe) - len(all_responses)
                 all_responses.extend([None] * remaining)
                 aborted = True
@@ -221,14 +209,11 @@ def fetch_multi_day_weather(dataframe):
 
         time.sleep(BATCH_PAUSE_SEC)
 
-    print(f"[weather] fetch finished in {time.time() - t0:.1f}s (aborted={aborted})", flush=True)
-    # Stash abort flag for caller (live vs partial labeling)
     dataframe.attrs["weather_aborted"] = aborted
     n_ok = sum(1 for x in all_responses if x is not None)
     dataframe.attrs["weather_ok_locations"] = n_ok
-    print(f"[weather] locations with API data: {n_ok}/{len(dataframe)}", flush=True)
 
-    peak_indices = [14, 38, 62, 86]  # ~afternoon peak each of the 4 forecast days
+    peak_indices = [14, 38, 62, 86]
     for d_idx, h_idx in enumerate(peak_indices):
         temps, rh, wind, apparent = [], [], [], []
         for item in all_responses:
@@ -262,10 +247,13 @@ def fetch_multi_day_weather(dataframe):
 
         dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
 
+        # Clamp wind speed to min 0.5 m/s to prevent pythermalcomfort NaN returns
+        v_clamped = [max(0.5, float(w)) if not pd.isna(w) else 0.5 for w in dataframe[f"Wind Speed_d{d_idx}"]]
+
         u_res = utci(
             tdb=dataframe[f"Dry Bulb Temp_d{d_idx}"].tolist(),
             tr=dataframe[f"Mean Radiant Temp_d{d_idx}"].tolist(),
-            v=dataframe[f"Wind Speed_d{d_idx}"].tolist(),
+            v=v_clamped,
             rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
         )
         vals = u_res.utci if hasattr(u_res, "utci") else u_res
@@ -277,7 +265,6 @@ def fetch_multi_day_weather(dataframe):
 
 
 def fill_synthetic_weather(dataframe):
-    """Instant fallback so the HTTP server can bind before any network I/O."""
     for d_idx in range(4):
         n = len(dataframe)
         np.random.seed(42 + d_idx)
@@ -294,10 +281,12 @@ def fill_synthetic_weather(dataframe):
         ).round(1)
         dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
 
+        v_clamped = [max(0.5, float(w)) if not pd.isna(w) else 0.5 for w in dataframe[f"Wind Speed_d{d_idx}"]]
+
         u_res = utci(
             tdb=dataframe[f"Dry Bulb Temp_d{d_idx}"].tolist(),
             tr=dataframe[f"Mean Radiant Temp_d{d_idx}"].tolist(),
-            v=dataframe[f"Wind Speed_d{d_idx}"].tolist(),
+            v=v_clamped,
             rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
         )
         vals = u_res.utci if hasattr(u_res, "utci") else u_res
@@ -307,14 +296,11 @@ def fill_synthetic_weather(dataframe):
     return dataframe
 
 
-import math
-
 # ==============================================================================
 # TRI-INDEX BIOMETEOROLOGICAL ENGINE (NOAA HI, ISO WBGT, UTCI)
 # ==============================================================================
 
 def calculate_heat_index(t_c, rh):
-    """NOAA / Rothfusz Heat Index equation in deg C."""
     if pd.isna(t_c) or pd.isna(rh):
         return np.nan
     if t_c < 26.7:
@@ -342,21 +328,16 @@ def calculate_heat_index(t_c, rh):
 
 
 def calculate_wbgt(t_c, rh, wind_speed, solar_rad=800.0):
-    """ISO 7243 Outdoor WBGT approximation in deg C."""
     if pd.isna(t_c) or pd.isna(rh):
         return np.nan
-    # Vapor pressure e (hPa)
     e = (rh / 100.0) * 6.105 * math.exp((17.27 * t_c) / (237.7 + t_c))
-    # Australian BOM / Liljegren Outdoor WBGT approximation
     wbgt_shade = 0.567 * t_c + 0.393 * e + 3.94
-    # Solar radiation and wind dissipation adjustment
     v = max(float(wind_speed if not pd.isna(wind_speed) else 1.0), 0.5)
     solar_adj = (solar_rad / 800.0) * 2.2 - (v - 1.0) * 0.4
     return round(float(wbgt_shade + max(-1.0, solar_adj)), 1)
 
 
 def calculate_composite_hazard(hi, wbgt, utci_val):
-    """Composite Thermal Hazard Index (0 - 100 Normalized)."""
     if pd.isna(hi) or pd.isna(wbgt) or pd.isna(utci_val):
         return np.nan
     norm_hi = min(100.0, max(0.0, (hi - 20.0) / 30.0 * 100.0))
@@ -408,9 +389,7 @@ DEMO_WEIGHTS = {
 
 
 def enrich_derived_columns(dataframe):
-    """Stress categories + WBGT + Heat Index + Composite Hazard + mortality indices."""
     for d in range(4):
-        # Calculate NOAA Heat Index & ISO WBGT
         hi_list, wbgt_list, hazard_list = [], [], []
         t_vals = dataframe[f"Dry Bulb Temp_d{d}"].tolist()
         rh_vals = dataframe[f"Relative Humidity_d{d}"].tolist()
@@ -440,16 +419,11 @@ def enrich_derived_columns(dataframe):
     return dataframe
 
 
-# ---------------------------------------------------------------------------
-# CRITICAL FOR RENDER: never block module import with network I/O.
-# Fill synthetic data instantly so gunicorn can bind to $PORT within seconds.
-# Then refresh from Open-Meteo in a background thread.
-# ---------------------------------------------------------------------------
 df = fill_synthetic_weather(df)
 df = enrich_derived_columns(df)
 
 MEASUREMENTS = {
-    "🤖 AI Heat Vulnerability Index (0-100)": "AI HVI",
+    "AI Heat Vulnerability Index (0-100)": "AI HVI",
     "Composite Thermal Hazard (0-100)": "Composite Hazard",
     "UTCI (deg C)": "UTCI",
     "ISO 7243 WBGT (deg C)": "WBGT",
@@ -460,7 +434,7 @@ MEASUREMENTS = {
     "Relative Humidity (%)": "Relative Humidity",
 }
 DEFAULT_SLIDER_BOUNDS = {
-    "🤖 AI Heat Vulnerability Index (0-100)": [0, 100],
+    "AI Heat Vulnerability Index (0-100)": [0, 100],
     "Composite Thermal Hazard (0-100)": [0, 100],
     "UTCI (deg C)": [15, 45],
     "ISO 7243 WBGT (deg C)": [15, 42],
@@ -472,18 +446,16 @@ DEFAULT_SLIDER_BOUNDS = {
 }
 states_list = sorted(df["State"].unique().tolist())
 if "AHMEDABAD_WARDS" in ward_dfs:
-    states_list.append("📍 Municipal Wards: Ahmedabad (48 Wards)")
+    states_list.append("Municipal Wards: Ahmedabad (48 Wards)")
 if "BANGALORE_WARDS" in ward_dfs:
-    states_list.append("📍 Municipal Wards: Bengaluru (243 Wards)")
+    states_list.append("Municipal Wards: Bengaluru (243 Wards)")
 
-# Combine district and ward datasets into global working dataframe
 combined_df_list = [df]
 for w_key, w_df in ward_dfs.items():
     combined_df_list.append(w_df)
 
 full_df = pd.concat(combined_df_list, ignore_index=True)
 
-# Merge static spatial socio-demographic & urban built environment features
 if os.path.exists(SPATIAL_FEATURES_FILE):
     try:
         df_spatial = pd.read_csv(SPATIAL_FEATURES_FILE)
@@ -496,7 +468,6 @@ if os.path.exists(SPATIAL_FEATURES_FILE):
 full_df = fill_synthetic_weather(full_df)
 full_df = enrich_derived_columns(full_df)
 
-# Run ML HVI Engine predictions for each horizon
 for d_idx in range(4):
     try:
         scores, _ = get_hvi_predictions_and_features(full_df, horizon=d_idx)
@@ -511,15 +482,10 @@ district_options = [
     for _, r in df.iterrows()
 ]
 
-# Background live-data refresh every 3 hours (does not block port binding)
-import threading
-import sys
-from datetime import datetime, timezone
-
 REFRESH_INTERVAL_SEC = int(os.environ.get("WEATHER_REFRESH_HOURS", "3")) * 3600
 _weather_ready = False
 _weather_fetching = False
-_weather_source = "synthetic"  # synthetic | cache | live
+_weather_source = "synthetic"
 _last_weather_update = None
 _weather_lock = threading.Lock()
 _weather_thread_started = False
@@ -532,14 +498,8 @@ def _wlog(msg):
 
 
 def _run_one_weather_fetch(force=False):
-    """Fetch live data once.
-
-    force=False (auto loop): use fresh disk cache if available, else call API.
-    force=True  (Update data button): always call Open-Meteo (skip cache).
-    """
     global df, _weather_ready, _last_weather_update, _weather_fetching, _weather_source
     if not _weather_lock.acquire(blocking=False):
-        _wlog("[weather] fetch already in progress, skipping")
         return False
     _weather_fetching = True
     try:
@@ -552,13 +512,7 @@ def _run_one_weather_fetch(force=False):
             _last_weather_update = datetime.fromtimestamp(
                 os.path.getmtime(WEATHER_CACHE_FILE), tz=timezone.utc
             )
-            _wlog(f"[weather] using disk cache ({_last_weather_update.isoformat()})")
             return True
-
-        if force:
-            _wlog("[weather] MANUAL update requested — calling Open-Meteo (skipping cache)")
-        else:
-            _wlog(f"[weather] Open-Meteo fetch starting at {datetime.now(timezone.utc).isoformat()}")
 
         updated = fetch_multi_day_weather(working)
         updated = enrich_derived_columns(updated)
@@ -569,26 +523,18 @@ def _run_one_weather_fetch(force=False):
         _weather_ready = True
         _last_weather_update = datetime.now(timezone.utc)
         if aborted or n_ok < max(1, len(df) // 4):
-            # Mostly synthetic fill after 429 — do not claim full live data
             _weather_source = "synthetic"
-            _wlog(
-                f"[weather] partial/failed live fetch "
-                f"(ok={n_ok}/{len(df)}, aborted={aborted}) — UI stays on demo/synthetic"
-            )
         else:
             _weather_source = "live"
-            _wlog(f"[weather] live data loaded at {_last_weather_update.isoformat()} (ok={n_ok})")
         return True
     except Exception as e:
-        _wlog(f"[weather] fetch failed: {e}")
+        _wlog(f"[weather] Fetch failed: {e}")
         working = df.copy()
         if _load_weather_cache(working, max_age_hours=72):
             df = enrich_derived_columns(working)
             _weather_source = "cache"
-            _wlog("[weather] fell back to older disk cache")
         else:
             _weather_source = "synthetic"
-            _wlog("[weather] keeping synthetic data (API unavailable / rate-limited)")
         _weather_ready = True
         if _last_weather_update is None:
             _last_weather_update = datetime.now(timezone.utc)
@@ -599,8 +545,6 @@ def _run_one_weather_fetch(force=False):
 
 
 def _background_weather_loop():
-    """Daemon loop: fetch immediately, then every REFRESH_INTERVAL_SEC."""
-    _wlog("[weather] background loop started")
     while True:
         _run_one_weather_fetch()
         slept = 0
@@ -610,7 +554,6 @@ def _background_weather_loop():
 
 
 def ensure_weather_thread_started():
-    """Start the background loop once (safe under Gunicorn workers)."""
     global _weather_thread_started
     with _weather_thread_start_lock:
         if _weather_thread_started:
@@ -618,24 +561,18 @@ def ensure_weather_thread_started():
         _weather_thread_started = True
         t = threading.Thread(target=_background_weather_loop, daemon=True, name="weather-loop")
         t.start()
-        _wlog("[weather] background thread launched")
 
 
 def trigger_manual_weather_refresh():
-    """Start a forced live fetch (Update data button). Always hits the API."""
     ensure_weather_thread_started()
-    _wlog("[weather] === MANUAL Update data clicked ===")
     if _weather_fetching:
-        _wlog("[weather] manual update ignored — another fetch is still running")
         return False
 
     def _manual_job():
         try:
-            _wlog("[weather] manual job thread started (force=True)")
-            ok = _run_one_weather_fetch(force=True)
-            _wlog(f"[weather] manual job finished ok={ok}")
+            _run_one_weather_fetch(force=True)
         except Exception as e:
-            _wlog(f"[weather] manual job crashed: {e}")
+            _wlog(f"[weather] Manual update failed: {e}")
 
     t = threading.Thread(target=_manual_job, daemon=True, name="weather-manual")
     t.start()
@@ -651,7 +588,6 @@ server = app.server
 
 @server.before_request
 def _start_weather_on_first_request():
-    """Gunicorn-safe: launch the weather loop on the first HTTP request."""
     ensure_weather_thread_started()
 
 
@@ -660,38 +596,30 @@ app.index_string = '''
 <html>
     <head>
         {%metas%}
-        <title>India Thermal Comfort & Mortality Risk Platform</title>
+        <title>SIH 2026 PS 83 | National Heatwave Decision Support System</title>
         {%favicon%}
         {%css%}
         <style>
-            /* --- GLASSMORPHISM & ENTERPRISE UI STYLES --- */
             .glass-card {
-                border-radius: 16px !important;
-                transition: transform 0.25s ease, box-shadow 0.25s ease !important;
+                border-radius: 12px !important;
+                transition: transform 0.2s ease, box-shadow 0.2s ease !important;
             }
             .glass-card:hover {
                 transform: translateY(-2px);
-                box-shadow: 0 12px 28px rgba(0, 0, 0, 0.12) !important;
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08) !important;
             }
             .brand-header-banner {
                 background: linear-gradient(135deg, #0f172a 0%, #1e293b 60%, #1e3a8a 100%) !important;
-                border-radius: 16px;
+                border-radius: 12px;
                 color: #ffffff !important;
-                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+                box-shadow: 0 6px 20px rgba(15, 23, 42, 0.2);
             }
             .brand-header-banner p {
                 color: #94a3b8 !important;
             }
-            .metric-pill {
-                border-radius: 12px;
-                padding: 12px 16px;
-                background: rgba(255, 255, 255, 0.05);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-            }
 
-            /* --- LIGHT MODE CONTRAST ENHANCEMENTS --- */
             .light-mode {
-                background: linear-gradient(180deg, #f1f5f9 0%, #f8fafc 100%) !important;
+                background: #f8fafc !important;
                 color: #0f172a !important;
             }
             .light-mode .text-muted {
@@ -702,21 +630,19 @@ app.index_string = '''
                 font-weight: 600;
             }
             .light-mode .card {
-                background-color: rgba(255, 255, 255, 0.9) !important;
-                backdrop-filter: blur(12px) !important;
+                background-color: #ffffff !important;
                 border: 1px solid #cbd5e1 !important;
                 color: #0f172a !important;
-                border-radius: 16px !important;
+                border-radius: 12px !important;
             }
             .light-mode .card-header {
-                background-color: rgba(255, 255, 255, 0.95) !important;
+                background-color: #f1f5f9 !important;
                 border-bottom: 1px solid #e2e8f0 !important;
                 color: #0f172a !important;
-                border-top-left-radius: 16px !important;
-                border-top-right-radius: 16px !important;
+                border-top-left-radius: 12px !important;
+                border-top-right-radius: 12px !important;
             }
 
-            /* Light Mode Range Sliders & Tooltips */
             .light-mode .rc-slider-rail {
                 background-color: #cbd5e1 !important;
                 height: 6px !important;
@@ -732,54 +658,10 @@ app.index_string = '''
             }
             .light-mode .rc-slider-mark-text,
             .light-mode .rc-slider-mark-text-active {
-                color: #0f172a !important; /* High contrast Slate-900 */
+                color: #0f172a !important;
                 font-weight: 700 !important;
             }
-            .light-mode .rc-slider-dot {
-                border-color: #94a3b8 !important;
-                background-color: #ffffff !important;
-            }
-            .light-mode .rc-slider-dot-active {
-                border-color: #1d4ed8 !important;
-            }
-            .light-mode .rc-slider-tooltip-inner {
-                background-color: #0f172a !important;
-                color: #ffffff !important;
-                font-weight: 700 !important;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;
-            }
-            .light-mode .rc-slider-tooltip-arrow {
-                border-top-color: #0f172a !important;
-            }
 
-            /* Light Mode Dropdowns */
-            .light-mode .dash-dropdown,
-            .light-mode .Select-control,
-            .light-mode div[class*="-control"] {
-                background-color: #ffffff !important;
-                border-color: #cbd5e1 !important;
-                color: #0f172a !important;
-            }
-            .light-mode .Select-value,
-            .light-mode .Select-value-label,
-            .light-mode div[class*="-singleValue"] {
-                color: #0f172a !important;
-                font-weight: 600;
-            }
-            .light-mode .Select-placeholder,
-            .light-mode div[class*="-placeholder"],
-            .light-mode input::placeholder {
-                color: #475569 !important;
-                opacity: 1 !important;
-                font-weight: 500;
-            }
-            .light-mode .Select-input > input,
-            .light-mode div[class*="-Input"] input,
-            .light-mode div[class*="-Input"] {
-                color: #0f172a !important;
-            }
-
-            /* --- DARK MODE CONTRAST ENHANCEMENTS --- */
             .dark-mode {
                 background-color: #0f172a !important;
                 color: #f8fafc !important;
@@ -804,88 +686,6 @@ app.index_string = '''
             .dark-mode h1, .dark-mode h2, .dark-mode h3, .dark-mode h4, .dark-mode h5, .dark-mode h6 {
                 color: #ffffff !important;
             }
-
-            /* Dark Mode Range Sliders & Tooltips */
-            .dark-mode .rc-slider-rail {
-                background-color: #475569 !important;
-                height: 6px !important;
-            }
-            .dark-mode .rc-slider-track {
-                background-color: #60a5fa !important;
-                height: 6px !important;
-            }
-            .dark-mode .rc-slider-handle {
-                border: 2px solid #60a5fa !important;
-                background-color: #0f172a !important;
-                opacity: 1 !important;
-            }
-            .dark-mode .rc-slider-mark-text,
-            .dark-mode .rc-slider-mark-text-active {
-                color: #f8fafc !important; /* High contrast Slate-50 */
-                font-weight: 700 !important;
-            }
-            .dark-mode .rc-slider-dot {
-                border-color: #64748b !important;
-                background-color: #1e293b !important;
-            }
-            .dark-mode .rc-slider-dot-active {
-                border-color: #60a5fa !important;
-            }
-            .dark-mode .rc-slider-tooltip-inner {
-                background-color: #f8fafc !important;
-                color: #0f172a !important;
-                font-weight: 700 !important;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
-            }
-            .dark-mode .rc-slider-tooltip-arrow {
-                border-top-color: #f8fafc !important;
-            }
-
-            /* Dark Mode Dropdowns */
-            .dark-mode .dash-dropdown,
-            .dark-mode .Select-control,
-            .dark-mode div[class*="-control"] {
-                background-color: #1e293b !important;
-                border-color: #475569 !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode .Select-value,
-            .dark-mode .Select-value-label,
-            .dark-mode div[class*="-singleValue"] {
-                color: #f8fafc !important;
-                font-weight: 600;
-            }
-            .dark-mode .Select-placeholder,
-            .dark-mode div[class*="-placeholder"],
-            .dark-mode input::placeholder {
-                color: #cbd5e1 !important;
-                opacity: 1 !important;
-                font-weight: 500;
-            }
-            .dark-mode .Select-input > input,
-            .dark-mode div[class*="-Input"] input,
-            .dark-mode div[class*="-Input"] {
-                color: #f8fafc !important;
-            }
-            .dark-mode .Select-menu-outer,
-            .dark-mode div[class*="-menu"] {
-                background-color: #1e293b !important;
-                border: 1px solid #475569 !important;
-            }
-            .dark-mode .Select-option,
-            .dark-mode div[class*="-option"] {
-                background-color: #1e293b !important;
-                color: #f8fafc !important;
-            }
-            .dark-mode div[class*="-option"]:hover,
-            .dark-mode div[class*="-option"][class*="-is-focused"] {
-                background-color: #334155 !important;
-                color: #ffffff !important;
-            }
-            .dark-mode div[class*="-DropdownIndicator"] {
-                color: #cbd5e1 !important;
-                fill: #cbd5e1 !important;
-            }
             .dark-mode hr {
                 border-color: #334155 !important;
             }
@@ -903,22 +703,21 @@ app.index_string = '''
 '''
 
 app.layout = dbc.Container([
-    # Fast status poll (badge only). Maps refresh only when data-version actually changes.
     dcc.Interval(id="status-poll-interval", interval=12 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
 
-    # --- HEADER & THEME TOGGLE BANNER ---
+    # --- HEADER & CONTROLS BANNER ---
     dbc.Row([
         dbc.Col([
             html.Div([
-                html.Span("🇮🇳 SIH 2026 PS 83 • OFFICIAL PROTOTYPE", className="badge bg-danger text-light px-3 py-1 mb-2 fw-bold text-uppercase rounded-pill shadow-sm"),
+                html.Span("SIH 2026 PS 83 NATIONAL DECISION SUPPORT SYSTEM", className="badge bg-danger text-light px-3 py-1 mb-2 fw-bold text-uppercase rounded-pill shadow-sm"),
                 html.H2("India Thermal Comfort & Mortality Risk Platform", className="fw-bolder mb-1 text-white"),
-                html.P("Predictive biometeorological forecasting & localized demographic risk assessment engine", className="mb-0 text-light opacity-75")
+                html.P("Predictive biometeorological forecasting and localized demographic heat stress decision engine", className="mb-0 text-light opacity-75")
             ])
         ], md=6),
         dbc.Col([
             dbc.Button(
-                "🔔 Alert Dispatch Gateway",
+                "Emergency Advisory Gateway",
                 id="btn-open-alert-modal",
                 color="warning",
                 size="sm",
@@ -927,7 +726,7 @@ app.layout = dbc.Container([
             ),
             html.Span(id="live-status-badge", className="me-2"),
             dbc.Button(
-                "↻ Update data",
+                "Refresh Forecast Data",
                 id="btn-update-data",
                 color="light",
                 outline=True,
@@ -935,28 +734,28 @@ app.layout = dbc.Container([
                 className="me-2 fw-bold rounded-pill px-3 py-2",
                 n_clicks=0,
             ),
-            dbc.Switch(id="theme-switch", label="🌙 Dark Mode", value=False, className="fw-bold d-inline-block text-light ms-2")
+            dbc.Switch(id="theme-switch", label="Dark Mode", value=False, className="fw-bold d-inline-block text-light ms-2")
         ], md=6, className="d-flex justify-content-md-end align-items-center mt-3 mt-md-0")
     ], className="brand-header-banner p-4 my-3 align-items-center"),
     html.Div(id="update-feedback", className="small text-muted mb-2"),
 
     # --- ALERT DISPATCH MODAL ---
     dbc.Modal([
-        dbc.ModalHeader(dbc.ModalTitle("🔔 Automated Heatwave Alert Gateway & Dispatch")),
+        dbc.ModalHeader(dbc.ModalTitle("Automated Emergency Heat Advisory Gateway")),
         dbc.ModalBody([
-            html.P("Configure and trigger simulated SMS & WhatsApp emergency warnings for vulnerable populations and emergency responders.", className="text-muted small"),
+            html.P("Configure and trigger target-group emergency advisory broadcasts for vulnerable demographics and medical responders.", className="text-muted small"),
             dbc.Form([
                 dbc.Row([
                     dbc.Col([
-                        html.Label("Recipient Category / Target", className="fw-bold small"),
+                        html.Label("Recipient Target Category", className="fw-bold small"),
                         dcc.Dropdown(
                             id="alert-target-role",
                             options=[
-                                {"label": "🛠️ Outdoor & Construction Laborers", "value": "laborers"},
-                                {"label": "👵 Elderly & Vulnerable Households", "value": "vulnerable"},
-                                {"label": "🏫 Schools & Outdoor Sports", "value": "schools"},
-                                {"label": "🚑 Emergency Health Responders", "value": "health"},
-                                {"label": "🏛️ Municipal Disaster Management", "value": "municipal"},
+                                {"label": "Outdoor & Construction Workforce", "value": "laborers"},
+                                {"label": "Vulnerable & Elderly Populations", "value": "vulnerable"},
+                                {"label": "Educational Institutions & Childcare", "value": "schools"},
+                                {"label": "Emergency Medical & First Responders", "value": "health"},
+                                {"label": "Municipal Disaster Management Authorities", "value": "municipal"},
                             ],
                             value="laborers",
                             clearable=False,
@@ -967,8 +766,8 @@ app.layout = dbc.Container([
                         dbc.RadioItems(
                             id="alert-channel",
                             options=[
-                                {"label": "📱 WhatsApp Gateway (Gupshup / Meta API)", "value": "whatsapp"},
-                                {"label": "💬 SMS Gateway (Twilio / CDAC)", "value": "sms"},
+                                {"label": "WhatsApp Business Gateway (API)", "value": "whatsapp"},
+                                {"label": "Cellular SMS Gateway (CDAC/Twilio)", "value": "sms"},
                             ],
                             value="whatsapp",
                             inline=True,
@@ -976,15 +775,15 @@ app.layout = dbc.Container([
                         )
                     ], md=12),
                     dbc.Col([
-                        html.Label("Recipient Phone Number(s) / Broadcast Group", className="fw-bold small"),
-                        dbc.Input(id="alert-phone-input", type="text", placeholder="+91 98765 43210 or @district-health-group", value="+91 98765 43210"),
+                        html.Label("Recipient Broadcast Contact / Group", className="fw-bold small"),
+                        dbc.Input(id="alert-phone-input", type="text", placeholder="+91 98765 43210 or @district-disaster-desk", value="+91 98765 43210"),
                     ], md=12, className="mb-3"),
                     dbc.Col([
-                        html.Label("Custom Emergency Advisory", className="fw-bold small"),
+                        html.Label("Custom Emergency Advisory Text", className="fw-bold small"),
                         dbc.Textarea(
                             id="alert-message-body",
                             rows=3,
-                            value="⚠️ HEAT ACTION ALERT: Composite Thermal Hazard level EXTREME. Cease outdoor physical labor between 12:00-16:00. Ensure hydration stations active.",
+                            value="CRITICAL HEAT ADVISORY: Composite Thermal Hazard Index EXTREME. Mandatory suspension of high-intensity outdoor labor between 12:00-16:00 IST. Ensure hydration stations and cooling shelters are fully operational.",
                         ),
                     ], md=12, className="mb-3"),
                 ])
@@ -992,7 +791,7 @@ app.layout = dbc.Container([
             html.Div(id="alert-dispatch-status", className="mt-2")
         ]),
         dbc.ModalFooter([
-            dbc.Button("🚀 Trigger Emergency Dispatch", id="btn-send-alert", color="danger", className="fw-bold", n_clicks=0),
+            dbc.Button("Execute Advisory Broadcast", id="btn-send-alert", color="danger", className="fw-bold", n_clicks=0),
             dbc.Button("Close", id="btn-close-alert-modal", color="secondary", outline=True, n_clicks=0)
         ])
     ], id="alert-modal", is_open=False, size="lg"),
@@ -1002,14 +801,14 @@ app.layout = dbc.Container([
         dbc.CardBody([
             dbc.Row([
                 dbc.Col([
-                    html.Label("Select Forecast Horizon", className="fw-bold text-uppercase small text-muted mb-2"),
+                    html.Label("Forecast Horizon Target", className="fw-bold text-uppercase small text-muted mb-2"),
                     dcc.Dropdown(
                         id='forecast-horizon',
                         options=[
-                            {"label": "🔴 Real-Time Current", "value": 0},
-                            {"label": "📅 +1 Day Forecast", "value": 1},
-                            {"label": "📅 +2 Days Forecast", "value": 2},
-                            {"label": "📅 +3 Days Forecast", "value": 3},
+                            {"label": "Real-Time Observation", "value": 0},
+                            {"label": "+24 Hours Forecast", "value": 1},
+                            {"label": "+48 Hours Forecast", "value": 2},
+                            {"label": "+72 Hours Forecast", "value": 3},
                         ],
                         value=0,
                         clearable=False,
@@ -1023,38 +822,36 @@ app.layout = dbc.Container([
 
     # --- SECTION 1: MAP & INSPECTOR ---
     dbc.Row([
-        # LEFT COLUMN: THERMAL COMFORT MAP
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader(html.H5("1. Thermal Comfort & Climate Layer", className="mb-0 fw-bold")),
+                dbc.CardHeader(html.H5("Section 1: Biometeorological & Thermal Comfort Layer", className="mb-0 fw-bold")),
                 dbc.CardBody([
                     dbc.Row([
                         dbc.Col([
-                            html.Label("Visualization Layer", className="fw-bold small text-muted"),
+                            html.Label("Visualization Metric", className="fw-bold small text-muted"),
                             dcc.Dropdown(id='measurements', value="UTCI (deg C)", options=list(MEASUREMENTS.keys()), clearable=False)
                         ], md=6),
                         dbc.Col([
-                            html.Label("Filter State Focus", className="fw-bold small text-muted"),
+                            html.Label("State / Regional Focus", className="fw-bold small text-muted"),
                             dcc.Dropdown(id='state-filter', options=[{"label": "All India", "value": "ALL"}] + [{"label": s, "value": s} for s in states_list], value="ALL", clearable=False)
                         ], md=6)
                     ], className="mb-3"),
-                    html.Label("Color Bar Range Bounds", className="fw-bold small text-muted"),
+                    html.Label("Metric Scale Color Bounds", className="fw-bold small text-muted"),
                     dcc.RangeSlider(id='color-range-slider', min=15, max=45, value=[15, 45], step=0.5, tooltip={"placement": "bottom", "always_visible": True}, className="mb-4"),
                     dcc.Loading(dcc.Graph(id='district-map', config={"displayModeBar": False}))
                 ])
             ], className="shadow-sm border-0 h-100")
         ], lg=8, className="mb-4 mb-lg-0"),
 
-        # RIGHT COLUMN: INSPECTOR
         dbc.Col([
             dbc.Card([
                 dbc.CardHeader(html.H5("District Inspector", className="mb-0 fw-bold")),
                 dbc.CardBody([
-                    html.Label("Search & Select", className="fw-bold small text-muted"),
-                    dcc.Dropdown(id='district-search', options=district_options, placeholder="Type or select a district...", clearable=True, className="mb-4"),
+                    html.Label("Search District / Ward", className="fw-bold small text-muted"),
+                    dcc.Dropdown(id='district-search', options=district_options, placeholder="Select district or ward...", clearable=True, className="mb-4"),
                     html.Div(id='filler'),
                     html.Hr(className="my-4"),
-                    html.H6("National Stress Distribution", className="fw-bold text-muted mb-3"),
+                    html.H6("National Thermal Stress Distribution", className="fw-bold text-muted mb-3"),
                     dcc.Graph(id='stress-dist-chart', config={"displayModeBar": False}, style={"height": "220px"})
                 ])
             ], className="shadow-sm border-0 h-100")
@@ -1066,11 +863,11 @@ app.layout = dbc.Container([
         dbc.CardHeader(
             dbc.Row([
                 dbc.Col([
-                    html.H5("2. Projected Mortality Risk Index Map", className="mb-1 fw-bold text-danger"),
-                    html.P("Demographic mortality probability index (0 - 100) based on non-linear physiological strain", className="text-muted small mb-0")
+                    html.H5("Section 2: Demographic Mortality Risk Mapping", className="mb-1 fw-bold text-danger"),
+                    html.P("Demographic mortality risk index (0 - 100) derived from non-linear biometeorological physiological strain", className="text-muted small mb-0")
                 ], md=7),
                 dbc.Col([
-                    html.Label("Demographic Risk Class", className="fw-bold small text-muted"),
+                    html.Label("Demographic Population Cohort", className="fw-bold small text-muted"),
                     dcc.Dropdown(
                         id='demographic-class',
                         options=[{"label": k, "value": k} for k in DEMO_WEIGHTS.keys()],
@@ -1082,7 +879,7 @@ app.layout = dbc.Container([
         ),
         dbc.CardBody([
             html.Div([
-                html.Label("Mortality Risk Index Filter & Color Bounds", className="fw-bold small text-muted mb-1"),
+                html.Label("Mortality Risk Index Scale Bounds", className="fw-bold small text-muted mb-1"),
                 dcc.RangeSlider(
                     id='mortality-range-slider',
                     min=0,
@@ -1098,18 +895,18 @@ app.layout = dbc.Container([
         ])
     ], className="shadow-sm border-0 mb-4"),
 
-    # --- SECTION 3: WHAT-IF POLICY SIMULATOR ---
+    # --- SECTION 3: POLICY SIMULATOR ---
     dbc.Card([
         dbc.CardHeader(
             html.Div([
-                html.H5("3. Interactive 'What-If' Climate Resilience & Urban Cooling Simulator", className="mb-1 fw-bold text-success"),
-                html.P("Simulate real-time microclimate interventions (cool roofs, urban forest canopy, misting stations) to quantify thermal reduction & saved lives.", className="text-muted small mb-0")
+                html.H5("Section 3: Microclimate Mitigation & Policy Simulator", className="mb-1 fw-bold text-success"),
+                html.P("Simulate real-time microclimate interventions (cool roofs, urban tree canopy, misting stations) to quantify thermal reduction & saved lives.", className="text-muted small mb-0")
             ])
         ),
         dbc.CardBody([
             dbc.Row([
                 dbc.Col([
-                    html.Label("🌳 Urban Tree Canopy Cover Increase (%)", className="fw-bold small"),
+                    html.Label("Urban Tree Canopy Expansion (%)", className="fw-bold small"),
                     dcc.Slider(
                         id="policy-canopy-slider",
                         min=0,
@@ -1121,7 +918,7 @@ app.layout = dbc.Container([
                     ),
                 ], md=4, className="mb-3 mb-md-0 border-end pe-4"),
                 dbc.Col([
-                    html.Label("🏠 Cool Roof / High-Albedo Coating Coverage (%)", className="fw-bold small"),
+                    html.Label("High-Albedo / Cool Roof Deployment (%)", className="fw-bold small"),
                     dcc.Slider(
                         id="policy-coolroof-slider",
                         min=0,
@@ -1133,7 +930,7 @@ app.layout = dbc.Container([
                     ),
                 ], md=4, className="mb-3 mb-md-0 border-end pe-4"),
                 dbc.Col([
-                    html.Label("💨 Public Misting & Evaporative Cooling Deployment (%)", className="fw-bold small"),
+                    html.Label("Evaporative Misting Infrastructure Coverage (%)", className="fw-bold small"),
                     dcc.Slider(
                         id="policy-misting-slider",
                         min=0,
@@ -1149,12 +946,12 @@ app.layout = dbc.Container([
         ])
     ], className="shadow-sm border-0 mb-4"),
 
-    # --- SECTION 4: AI HEAT VULNERABILITY & FEATURE ATTRIBUTION ENGINE ---
+    # --- SECTION 4: AI HEAT VULNERABILITY ENGINE ---
     dbc.Card([
         dbc.CardHeader(
             html.Div([
-                html.H5("4. 🤖 AI Heat Vulnerability & Feature Attribution Engine (Random Forest XAI)", className="mb-1 fw-bold text-primary"),
-                html.P("Explains microclimate vulnerability by coupling real-time biometeorology with Census demographics & satellite built-environment data.", className="text-muted small mb-0")
+                html.H5("Section 4: Predictive AI Heat Vulnerability & Feature Attribution Engine", className="mb-1 fw-bold text-primary"),
+                html.P("Explains microclimate vulnerability by coupling real-time biometeorology with Census demographics and satellite built-environment parameters.", className="text-muted small mb-0")
             ])
         ),
         dbc.CardBody([
@@ -1197,7 +994,6 @@ def update_app_theme(dark_mode):
     prevent_initial_call=False,
 )
 def update_live_badge_and_button(_n, n_clicks, current_version):
-    """Status poll + Update button in ONE callback so clicks cannot be dropped."""
     from dash import ctx
 
     version = (
@@ -1208,22 +1004,16 @@ def update_live_badge_and_button(_n, n_clicks, current_version):
     version_out = version if version != current_version else no_update
     feedback = no_update
 
-    # Explicit click handling (must log every time)
     if ctx.triggered_id == "btn-update-data" and n_clicks and n_clicks > 0:
-        _wlog(f"[weather] BUTTON CLICK received n_clicks={n_clicks} fetching={_weather_fetching}")
         started = trigger_manual_weather_refresh()
         if started:
-            feedback = f"Update requested at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC — fetch started (see logs)."
+            feedback = f"Refresh initiated at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC."
         else:
-            feedback = f"Update clicked at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC — fetch already running or busy."
+            feedback = f"Refresh requested at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC (fetch already in progress)."
 
     if _weather_fetching:
-        badge = dbc.Badge(
-            "● Updating…",
-            color="info",
-            className="px-3 py-2 fs-6 rounded-pill shadow-sm",
-        )
-        return badge, "↻ Updating…", version_out, feedback
+        badge = dbc.Badge("Updating...", color="info", className="px-3 py-2 fs-6 rounded-pill shadow-sm")
+        return badge, "Updating...", version_out, feedback
 
     if _weather_ready:
         ts = (
@@ -1232,20 +1022,16 @@ def update_live_badge_and_button(_n, n_clicks, current_version):
             else "—"
         )
         if _weather_source == "live":
-            text, color = f"● Live · {ts} · every 3h", "success"
+            text, color = f"Live Feed ({ts})", "success"
         elif _weather_source == "cache":
-            text, color = f"● Cached · {ts}", "success"
+            text, color = f"Cached Feed ({ts})", "success"
         else:
-            text, color = "● Demo data · API rate-limited — try later", "warning"
+            text, color = "Demonstration Feed", "warning"
         badge = dbc.Badge(text, color=color, className="px-3 py-2 fs-6 rounded-pill shadow-sm")
-        return badge, "↻ Update data", version_out, feedback
+        return badge, "Refresh Forecast Data", version_out, feedback
 
-    badge = dbc.Badge(
-        "● Starting…",
-        color="secondary",
-        className="px-3 py-2 fs-6 rounded-pill shadow-sm",
-    )
-    return badge, "↻ Update data", version_out, feedback
+    badge = dbc.Badge("Initializing...", color="secondary", className="px-3 py-2 fs-6 rounded-pill shadow-sm")
+    return badge, "Refresh Forecast Data", version_out, feedback
 
 
 @callback(
@@ -1258,7 +1044,6 @@ def update_kpis(horizon, dark_mode, _version):
     utci_col = f"UTCI_d{horizon}"
     temp_col = f"Dry Bulb Temp_d{horizon}"
     
-    # Exclude municipal wards for national district KPIs
     district_df = df[df["State"] != "Municipal Wards"]
     valid = district_df.dropna(subset=[temp_col])
     avg_u = round(district_df[utci_col].mean(), 1) if not district_df[utci_col].empty else "N/A"
@@ -1266,15 +1051,15 @@ def update_kpis(horizon, dark_mode, _version):
     min_r = valid.loc[valid[temp_col].idxmin()] if not valid.empty else None
 
     if dark_mode:
-        avg_color = "#60a5fa"   # Bright Light Blue
-        hot_color = "#f87171"   # Soft Red
-        cool_color = "#38bdf8"  # Bright Cyan
-        dist_color = "#f8fafc"  # White/Light Slate
+        avg_color = "#60a5fa"
+        hot_color = "#f87171"
+        cool_color = "#38bdf8"
+        dist_color = "#f8fafc"
     else:
-        avg_color = "#1d4ed8"   # High-contrast Deep Blue
-        hot_color = "#b91c1c"   # High-contrast Deep Red
-        cool_color = "#0369a1"   # High-contrast Deep Sky Blue
-        dist_color = "#0f172a"   # Dark Slate
+        avg_color = "#1d4ed8"
+        hot_color = "#b91c1c"
+        cool_color = "#0369a1"
+        dist_color = "#0f172a"
 
     return dbc.Row([
         dbc.Col([
@@ -1324,7 +1109,6 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     target_col = f"{MEASUREMENTS[measurement_chosen]}_d{horizon}"
     r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS[measurement_chosen]
 
-    # Handle Municipal Ward Layer vs District Layer
     if "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
         active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
         filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
@@ -1382,7 +1166,6 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
 def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode, _version):
     target_col = f"Mortality_{demo_class}_d{horizon}"
 
-    # Handle Municipal Ward Layer vs District Layer
     if "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
         active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
         filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
@@ -1468,17 +1251,17 @@ def toggle_and_dispatch_alert(open_click, close_click, send_click, role, channel
         return False, None
 
     if triggered == "btn-send-alert" and send_click > 0:
-        channel_name = "WhatsApp Gateway" if channel == "whatsapp" else "SMS Gateway"
+        channel_name = "WhatsApp Business Gateway" if channel == "whatsapp" else "Cellular SMS Gateway"
         role_label = role.title()
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         status_box = dbc.Alert([
-            html.Div(f"✅ ALERT DISPATCH SUCCESSFUL ({timestamp})", className="fw-bold mb-1"),
-            html.Div(f"• Channel: {channel_name}"),
-            html.Div(f"• Target Group: {role_label}"),
-            html.Div(f"• Recipient: {phone}"),
-            html.Div(f"• Message Body: '{message_body}'"),
-            html.Div("• Status: Broadcast sent & logged in audit ledger.", className="small mt-1 text-success fw-bold")
+            html.Div(f"ALERT DISPATCH EXECUTED SUCCESSFULLY ({timestamp})", className="fw-bold mb-1"),
+            html.Div(f"- Channel: {channel_name}"),
+            html.Div(f"- Target Group: {role_label}"),
+            html.Div(f"- Recipient: {phone}"),
+            html.Div(f"- Message Body: '{message_body}'"),
+            html.Div("- Status: Broadcast logged in operational dispatch ledger.", className="small mt-1 text-success fw-bold")
         ], color="success", className="mb-0")
         return True, status_box
 
@@ -1493,22 +1276,18 @@ def toggle_and_dispatch_alert(open_click, close_click, send_click, role, channel
     Input("policy-misting-slider", "value"),
 )
 def update_policy_simulation(canopy_pct, coolroof_pct, misting_pct):
-    # Microclimate physics model:
-    # 1. Tree Canopy: reduces Mean Radiant Temp by ~0.15°C per % and Dry Bulb by ~0.08°C per %
-    # 2. Cool Roofs: reduces Air Temp by ~0.05°C per %
-    # 3. Misting: reduces UTCI & WBGT by ~0.12°C per %
     temp_drop = round(canopy_pct * 0.08 + coolroof_pct * 0.05, 2)
     utci_drop = round(canopy_pct * 0.15 + coolroof_pct * 0.06 + misting_pct * 0.12, 2)
     mortality_drop = round(utci_drop * 2.4, 1)
 
     if canopy_pct == 0 and coolroof_pct == 0 and misting_pct == 0:
-        return "💡 Adjust the sliders above to model real-time cooling interventions and quantify heat stress reduction.", "secondary"
+        return "Adjust policy parameters above to evaluate real-time thermal mitigation and mortality reduction metrics.", "secondary"
 
     msg = (
-        f"🎯 Simulated Intervention Impact: "
-        f"Air Temperature drop: -{temp_drop}°C | "
-        f"UTCI Thermal Strain drop: -{utci_drop}°C | "
-        f"Estimated Mortality Risk reduction: -{mortality_drop}% across vulnerable districts."
+        f"Simulated Intervention Impact: "
+        f"Air Temperature Reduction: -{temp_drop}°C | "
+        f"UTCI Thermal Strain Reduction: -{utci_drop}°C | "
+        f"Estimated Mortality Risk Reduction: -{mortality_drop}% across target regions."
     )
     return msg, "success"
 
@@ -1520,29 +1299,30 @@ def update_policy_simulation(canopy_pct, coolroof_pct, misting_pct):
 )
 def show_district_detail(searched_district, horizon, demo_class, dark_mode):
     if not searched_district:
-        return html.Div("👆 Select or click any district on the map to inspect micro-climate metrics.", className="text-center text-muted p-4 mt-2 fw-bold")
+        return html.Div("Select or click any district on the map to inspect localized biometeorological metrics.", className="text-center text-muted p-4 mt-2 fw-bold")
 
     row = df[df['join_key'] == searched_district]
     if row.empty: return no_update
     r = row.iloc[0]
 
-    h_label = ["Current Peak", "+1 Day Forecast", "+2 Day Forecast", "+3 Day Forecast"][horizon]
+    h_label = ["Current Observation", "+24h Forecast", "+48h Forecast", "+72h Forecast"][horizon]
     m_idx = r[f"Mortality_{demo_class}_d{horizon}"]
     wbgt_v = r.get(f"WBGT_d{horizon}", "N/A")
     hi_v = r.get(f"Heat Index_d{horizon}", "N/A")
     haz_v = r.get(f"Composite Hazard_d{horizon}", "N/A")
 
-    whatsapp_text = (
-        f"🌡️ *India Thermal & Mortality Risk Alert ({h_label}) - {r['District']}, {r['State']}*\n\n"
-        f"• *Composite Thermal Hazard:* {haz_v} / 100\n"
-        f"• *UTCI Stress:* {r[f'UTCI_d{horizon}']}°C ({r[f'Stress Category_d{horizon}']})\n"
-        f"• *ISO WBGT (Outdoor):* {wbgt_v}°C\n"
-        f"• *NOAA Heat Index:* {hi_v}°C\n"
-        f"• *Mortality Index ({demo_class}):* {m_idx}/100\n"
-        f"• *Air Temp:* {r[f'Dry Bulb Temp_d{horizon}']}°C (Feels like {r[f'Apparent Temp_d{horizon}']}°C)\n"
-        f"• *Humidity:* {r[f'Relative Humidity_d{horizon}']}%"
+    bulletin_text = (
+        f"NATIONAL HEAT ADVISORY BULLETIN ({h_label})\n"
+        f"Location: {r['District']}, {r['State']}\n\n"
+        f"- Composite Thermal Hazard Index: {haz_v} / 100\n"
+        f"- UTCI Thermal Strain: {r[f'UTCI_d{horizon}']}°C ({r[f'Stress Category_d{horizon}']})\n"
+        f"- ISO 7243 Outdoor WBGT: {wbgt_v}°C\n"
+        f"- NOAA Heat Index: {hi_v}°C\n"
+        f"- Projected Mortality Risk Index ({demo_class}): {m_idx} / 100\n"
+        f"- Dry Bulb Air Temp: {r[f'Dry Bulb Temp_d{horizon}']}°C (Apparent: {r[f'Apparent Temp_d{horizon}']}°C)\n"
+        f"- Relative Humidity: {r[f'Relative Humidity_d{horizon}']}%"
     )
-    wa_url = f"https://wa.me/?text={urllib.parse.quote(whatsapp_text)}"
+    wa_url = f"https://wa.me/?text={urllib.parse.quote(bulletin_text)}"
 
     if dark_mode:
         card_bg = "bg-dark border-secondary"
@@ -1570,29 +1350,29 @@ def show_district_detail(searched_district, horizon, demo_class, dark_mode):
         dbc.Row([
             dbc.Col(
                 dbc.Card(dbc.CardBody([
-                    html.Div("🤖 AI HVI Score", className="text-muted small fw-bold text-uppercase"),
+                    html.Div("AI Vulnerability Index", className="text-muted small fw-bold text-uppercase"),
                     html.Div(f"{ai_hvi_val} / 100", className=f"fs-3 fw-bolder {text_color}"),
                     html.Span(f"{r[f'Stress Category_d{horizon}']}", className="badge bg-warning text-dark mt-1")
                 ]), className=f"{card_bg} text-center"), width=6
             ),
             dbc.Col(
                 dbc.Card(dbc.CardBody([
-                    html.Div("Mortality Index", className="small fw-bold text-uppercase", style={"color": mortality_label_color}),
+                    html.Div("Mortality Risk Index", className="small fw-bold text-uppercase", style={"color": mortality_label_color}),
                     html.Div(f"{m_idx} / 100", className="fs-3 fw-bolder", style={"color": mortality_text_color}),
                 ]), className="text-center", style={"backgroundColor": mortality_card_bg, "border": f"1px solid {mortality_border}"}), width=6
             )
         ], className="g-2 mb-3"),
 
         dbc.Row([
-            dbc.Col([html.Span("UTCI Stress: ", className="text-muted"), html.B(f"{r[f'UTCI_d{horizon}']} °C")], width=6),
+            dbc.Col([html.Span("UTCI Strain: ", className="text-muted"), html.B(f"{r[f'UTCI_d{horizon}']} °C")], width=6),
             dbc.Col([html.Span("ISO WBGT: ", className="text-muted"), html.B(f"{wbgt_v} °C")], width=6),
             dbc.Col([html.Span("NOAA Heat Index: ", className="text-muted"), html.B(f"{hi_v} °C")], width=6),
             dbc.Col([html.Span("Air Temp: ", className="text-muted"), html.B(f"{r[f'Dry Bulb Temp_d{horizon}']} °C")], width=6),
-            dbc.Col([html.Span("Feels Like: ", className="text-muted"), html.B(f"{r[f'Apparent Temp_d{horizon}']} °C")], width=6),
+            dbc.Col([html.Span("Apparent Temp: ", className="text-muted"), html.B(f"{r[f'Apparent Temp_d{horizon}']} °C")], width=6),
             dbc.Col([html.Span("Humidity: ", className="text-muted"), html.B(f"{r[f'Relative Humidity_d{horizon}']}%")], width=6),
         ], className="small mb-3 g-2"),
 
-        dbc.Button("📱 Share Report via WhatsApp", href=wa_url, target="_blank", color="success", className="w-100 fw-bold")
+        dbc.Button("Export Advisory via WhatsApp", href=wa_url, target="_blank", color="success", className="w-100 fw-bold")
     ])
 
 @callback(
@@ -1647,18 +1427,18 @@ def update_ai_insights(horizon, searched_district, dark_mode, _version):
         lst_v = row.get("lst_offset_c", 1.5)
 
         insights = html.Div([
-            html.Div(f"📍 Location Analysis: {dt_name}", className="fw-bold mb-2 text-primary fs-6"),
-            html.Div(f"• Predicted AI Heat Vulnerability Score: {hvi_val} / 100", className="fw-bold text-danger mb-1"),
-            html.Div(f"• Built Environment Drivers: High NDBI concrete density ({ndbi_v*100:.0f}%) + Urban Heat Island offset (+{lst_v}°C) amplify thermal retention."),
-            html.Div(f"• Ecological Mitigation: Tree Canopy Cover (NDVI) is {ndvi_v*100:.0f}% (Target: >30% for cooling effect).", className="mt-1"),
-            html.Div(f"• Socio-Demographic Exposure: {labor_v:.0f}% outdoor workforce exposed during afternoon peak hours.", className="mt-1"),
+            html.Div(f"Location Analysis: {dt_name}", className="fw-bold mb-2 text-primary fs-6"),
+            html.Div(f"- Predicted AI Heat Vulnerability Index: {hvi_val} / 100", className="fw-bold text-danger mb-1"),
+            html.Div(f"- Built Environment Drivers: High NDBI concrete density ({ndbi_v*100:.0f}%) + Urban Heat Island offset (+{lst_v}°C) amplify thermal retention."),
+            html.Div(f"- Ecological Mitigation: Tree Canopy Cover (NDVI) is {ndvi_v*100:.0f}% (Target: >30% for cooling effect).", className="mt-1"),
+            html.Div(f"- Socio-Demographic Exposure: {labor_v:.0f}% outdoor workforce exposed during peak afternoon heat.", className="mt-1"),
         ], className="small")
     else:
         insights = html.Div([
-            html.Div("🇮🇳 National Overview AI Summary", className="fw-bold mb-2 text-primary fs-6"),
-            html.Div("• Primary Heat Drivers: ISO 7243 WBGT & UTCI physiological strain contribute ~60% of total risk score."),
-            html.Div("• Secondary Vulnerability Amplifiers: Urban Built-up density (NDBI) and low vegetation (NDVI) account for ~20% of spatial variance across Indian wards."),
-            html.Div("• Select a specific district on the map or search dropdown to inspect local feature attributions.", className="mt-2 text-muted fst-italic"),
+            html.Div("National Overview AI Summary", className="fw-bold mb-2 text-primary fs-6"),
+            html.Div("- Primary Heat Drivers: ISO 7243 WBGT & UTCI physiological strain account for ~60% of total vulnerability score."),
+            html.Div("- Secondary Amplifiers: Urban built-up density (NDBI) and low vegetation (NDVI) account for ~20% of spatial variance across Indian wards."),
+            html.Div("- Select a specific district on the map or search dropdown to inspect localized feature attributions.", className="mt-2 text-muted fst-italic"),
         ], className="small")
 
     return fig, insights
