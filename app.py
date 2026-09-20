@@ -1,23 +1,41 @@
 import os
-from dash import Dash, dcc, html, callback, Input, Output, State, no_update
-import dash_bootstrap_components as dbc
-import plotly.express as px
-import pandas as pd
-import numpy as np
-import requests
-import urllib.parse
+import sys
 import json
 import time
 import math
+import urllib.parse
 import threading
-import sys
 from datetime import datetime, timezone
 
-from pythermalcomfort.models import utci
+import pandas as pd
+import numpy as np
+import requests
+import plotly.express as px
+from dash import Dash, dcc, html, callback, Input, Output, State, no_update
+import dash_bootstrap_components as dbc
+
+# Import modular biometeorological, weather, and machine learning engines
+from src.biomet_engine import (
+    calculate_heat_index,
+    calculate_wbgt,
+    calculate_composite_hazard,
+    utci_stress_category,
+    calculate_f_utci,
+    enrich_derived_columns,
+    DEMO_WEIGHTS,
+    MEASUREMENTS,
+    DEFAULT_SLIDER_BOUNDS,
+)
+from src.weather_service import (
+    save_weather_cache,
+    load_weather_cache,
+    fetch_multi_day_weather,
+    fill_synthetic_weather,
+)
 from src.ml_engine import get_hvi_predictions_and_features
 
 # ==============================================================================
-# DATA INGESTION & PROCESSING
+# DATA INGESTION & GEOSPATIAL BOUNDARIES
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,10 +44,10 @@ GEOJSON_FILE = os.environ.get("GEOJSON_FILE", os.path.join(BASE_DIR, "data/geo/I
 SPATIAL_FEATURES_FILE = os.environ.get("SPATIAL_FEATURES_FILE", os.path.join(BASE_DIR, "data/spatial_features.csv"))
 
 df = pd.read_excel(CENTROIDS_FILE)
-required = {"join_key", "District", "State", "lat", "lon"}
-missing = required - set(df.columns)
-if missing:
-    raise ValueError(f"Centroids Excel missing required columns: {missing}")
+required_cols = {"join_key", "District", "State", "lat", "lon"}
+missing_cols = required_cols - set(df.columns)
+if missing_cols:
+    raise ValueError(f"Centroids Excel missing required columns: {missing_cols}")
 
 with open(GEOJSON_FILE) as f:
     district_geojson = json.load(f)
@@ -88,372 +106,9 @@ for ward_key, filepath in WARD_FILES.items():
         except Exception as e:
             print(f"[ward-gis] Failed to load {ward_key}: {e}", flush=True)
 
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-BATCH_SIZE = 40
-BATCH_PAUSE_SEC = 1.5
-FETCH_MAX_SECONDS = int(os.environ.get("FETCH_MAX_SECONDS", "90"))
 WEATHER_CACHE_FILE = os.environ.get("WEATHER_CACHE_FILE", os.path.join(BASE_DIR, "weather_cache.pkl"))
+FETCH_MAX_SECONDS = int(os.environ.get("FETCH_MAX_SECONDS", "90"))
 CACHE_MAX_AGE_HOURS = float(os.environ.get("CACHE_MAX_AGE_HOURS", "6"))
-
-
-def _save_weather_cache(dataframe):
-    try:
-        cols = [c for c in dataframe.columns if any(
-            c.startswith(p) for p in (
-                "Dry Bulb Temp_d", "Relative Humidity_d", "Wind Speed_d",
-                "Apparent Temp_d", "Mean Radiant Temp_d", "UTCI_d",
-                "Stress Category_d", "Mortality_",
-            )
-        )]
-        dataframe[["join_key"] + cols].to_pickle(WEATHER_CACHE_FILE)
-        print(f"[weather] Cache saved to {WEATHER_CACHE_FILE}", flush=True)
-    except Exception as e:
-        print(f"[weather] Cache save failed: {e}", flush=True)
-
-
-def _load_weather_cache(dataframe, max_age_hours=None):
-    if not os.path.exists(WEATHER_CACHE_FILE):
-        return False
-    try:
-        age_h = (time.time() - os.path.getmtime(WEATHER_CACHE_FILE)) / 3600.0
-        limit = CACHE_MAX_AGE_HOURS if max_age_hours is None else max_age_hours
-        if age_h > limit:
-            print(f"[weather] Cache expired ({age_h:.1f}h > {limit}h)", flush=True)
-            return False
-        cache_df = pd.read_pickle(WEATHER_CACHE_FILE)
-        if "join_key" not in cache_df.columns:
-            return False
-        if not set(dataframe["join_key"]).issubset(set(cache_df["join_key"])):
-            print(f"[weather] Cache invalid (missing keys for some locations)", flush=True)
-            return False
-        merged = dataframe.drop(
-            columns=[c for c in dataframe.columns if c in cache_df.columns and c != "join_key"],
-            errors="ignore",
-        ).merge(cache_df, on="join_key", how="left")
-        for c in cache_df.columns:
-            if c != "join_key":
-                dataframe[c] = merged[c].values
-        print(f"[weather] Disk cache loaded successfully (age: {age_h:.1f}h)", flush=True)
-        return True
-    except Exception as e:
-        print(f"[weather] Cache load failed: {e}", flush=True)
-        return False
-
-
-def fetch_batch(lats, lons):
-    params = {
-        "latitude": ",".join(f"{x:.4f}" for x in lats),
-        "longitude": ",".join(f"{x:.4f}" for x in lons),
-        "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
-        "forecast_days": 4,
-        "wind_speed_unit": "ms",
-        "timezone": "auto",
-    }
-    for attempt in range(2):
-        try:
-            res = requests.get(OPEN_METEO_URL, params=params, timeout=45)
-            if res.status_code == 429:
-                if attempt == 0:
-                    time.sleep(8)
-                    continue
-                return [None] * len(lats), True
-            res.raise_for_status()
-            data = res.json()
-            if isinstance(data, dict) and "hourly" in data:
-                return [data], False
-            if isinstance(data, list):
-                return data, False
-            if isinstance(data, dict) and "latitude" in data:
-                return [data], False
-            return [None] * len(lats), False
-        except Exception as e:
-            print(f"[weather] Batch error: {e}", flush=True)
-            if attempt == 0:
-                time.sleep(3)
-                continue
-            return [None] * len(lats), False
-    return [None] * len(lats), True
-
-
-def fetch_multi_day_weather(dataframe):
-    lats, lons = dataframe["lat"].tolist(), dataframe["lon"].tolist()
-    all_responses = []
-    n_batches = (len(dataframe) + BATCH_SIZE - 1) // BATCH_SIZE
-    t0 = time.time()
-    consecutive_rate_limits = 0
-    aborted = False
-
-    for bi, i in enumerate(range(0, len(dataframe), BATCH_SIZE)):
-        if time.time() - t0 > FETCH_MAX_SECONDS:
-            remaining = len(dataframe) - len(all_responses)
-            all_responses.extend([None] * remaining)
-            aborted = True
-            break
-
-        b_lats = lats[i:i + BATCH_SIZE]
-        b_lons = lons[i:i + BATCH_SIZE]
-        batch_res, hit_limit = fetch_batch(b_lats, b_lons)
-
-        if hit_limit:
-            consecutive_rate_limits += 1
-            all_responses.extend([None] * len(b_lats))
-            if consecutive_rate_limits >= 2:
-                remaining = len(dataframe) - len(all_responses)
-                all_responses.extend([None] * remaining)
-                aborted = True
-                break
-        else:
-            consecutive_rate_limits = 0
-            if len(batch_res) != len(b_lats):
-                if len(batch_res) == 1 and batch_res[0] and "hourly" in batch_res[0]:
-                    all_responses.extend([None] * len(b_lats))
-                else:
-                    all_responses.extend((batch_res + [None] * len(b_lats))[: len(b_lats)])
-            else:
-                all_responses.extend(batch_res)
-
-        time.sleep(BATCH_PAUSE_SEC)
-
-    dataframe.attrs["weather_aborted"] = aborted
-    n_ok = sum(1 for x in all_responses if x is not None)
-    dataframe.attrs["weather_ok_locations"] = n_ok
-
-    peak_indices = [14, 38, 62, 86]
-    for d_idx, h_idx in enumerate(peak_indices):
-        temps, rh, wind, apparent = [], [], [], []
-        for item in all_responses:
-            if item and isinstance(item, dict) and "hourly" in item:
-                h = item["hourly"]
-                temps.append(h["temperature_2m"][h_idx] if len(h.get("temperature_2m", [])) > h_idx else None)
-                rh.append(h["relative_humidity_2m"][h_idx] if len(h.get("relative_humidity_2m", [])) > h_idx else None)
-                wind.append(h["wind_speed_10m"][h_idx] if len(h.get("wind_speed_10m", [])) > h_idx else None)
-                apparent.append(h["apparent_temperature"][h_idx] if len(h.get("apparent_temperature", [])) > h_idx else None)
-            else:
-                temps.append(None)
-                rh.append(None)
-                wind.append(None)
-                apparent.append(None)
-
-        dataframe[f"Dry Bulb Temp_d{d_idx}"] = temps
-        dataframe[f"Relative Humidity_d{d_idx}"] = rh
-        dataframe[f"Wind Speed_d{d_idx}"] = wind
-        dataframe[f"Apparent Temp_d{d_idx}"] = apparent
-
-        mask = dataframe[f"Dry Bulb Temp_d{d_idx}"].isna()
-        if mask.any():
-            n = int(mask.sum())
-            np.random.seed(42 + d_idx)
-            dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] = np.random.uniform(20.0, 43.0, n).round(1)
-            dataframe.loc[mask, f"Relative Humidity_d{d_idx}"] = np.random.uniform(20.0, 85.0, n).round(1)
-            dataframe.loc[mask, f"Wind Speed_d{d_idx}"] = np.random.uniform(0.5, 7.5, n).round(1)
-            dataframe.loc[mask, f"Apparent Temp_d{d_idx}"] = (
-                dataframe.loc[mask, f"Dry Bulb Temp_d{d_idx}"] + np.random.uniform(-1.0, 4.0, n)
-            ).round(1)
-
-        dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
-
-        # Clamp wind speed to min 0.5 m/s to prevent pythermalcomfort NaN returns
-        v_clamped = [max(0.5, float(w)) if not pd.isna(w) else 0.5 for w in dataframe[f"Wind Speed_d{d_idx}"]]
-
-        u_res = utci(
-            tdb=dataframe[f"Dry Bulb Temp_d{d_idx}"].tolist(),
-            tr=dataframe[f"Mean Radiant Temp_d{d_idx}"].tolist(),
-            v=v_clamped,
-            rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
-        )
-        vals = u_res.utci if hasattr(u_res, "utci") else u_res
-        dataframe[f"UTCI_d{d_idx}"] = [
-            round(v, 1) if not pd.isna(v) else np.nan for v in vals
-        ]
-
-    return dataframe
-
-
-def fill_synthetic_weather(dataframe):
-    for d_idx in range(4):
-        n = len(dataframe)
-        np.random.seed(42 + d_idx)
-        dataframe[f"Dry Bulb Temp_d{d_idx}"] = np.random.uniform(22.0, 40.0, n).round(1)
-        dataframe[f"Relative Humidity_d{d_idx}"] = np.random.uniform(25.0, 80.0, n).round(1)
-        dataframe[f"Wind Speed_d{d_idx}"] = np.random.uniform(0.5, 6.0, n).round(1)
-        dataframe[f"Apparent Temp_d{d_idx}"] = (
-            dataframe[f"Dry Bulb Temp_d{d_idx}"] + np.random.uniform(-1.0, 3.0, n)
-        ).round(1)
-        dataframe[f"Pressure_d{d_idx}"] = np.random.uniform(990.0, 1015.0, n).round(1)
-        dataframe[f"Cloud Cover_d{d_idx}"] = np.random.uniform(0.0, 100.0, n).round(1)
-        dataframe[f"Precipitation_d{d_idx}"] = np.random.choice(
-            [0.0, 0.0, 0.0, 0.5, 2.0], size=n
-        ).round(1)
-        dataframe[f"Mean Radiant Temp_d{d_idx}"] = dataframe[f"Dry Bulb Temp_d{d_idx}"]
-
-        v_clamped = [max(0.5, float(w)) if not pd.isna(w) else 0.5 for w in dataframe[f"Wind Speed_d{d_idx}"]]
-
-        u_res = utci(
-            tdb=dataframe[f"Dry Bulb Temp_d{d_idx}"].tolist(),
-            tr=dataframe[f"Mean Radiant Temp_d{d_idx}"].tolist(),
-            v=v_clamped,
-            rh=dataframe[f"Relative Humidity_d{d_idx}"].tolist(),
-        )
-        vals = u_res.utci if hasattr(u_res, "utci") else u_res
-        dataframe[f"UTCI_d{d_idx}"] = [
-            round(v, 1) if not pd.isna(v) else np.nan for v in vals
-        ]
-    return dataframe
-
-
-# ==============================================================================
-# TRI-INDEX BIOMETEOROLOGICAL ENGINE (NOAA HI, ISO WBGT, UTCI)
-# ==============================================================================
-
-def calculate_heat_index(t_c, rh):
-    if pd.isna(t_c) or pd.isna(rh):
-        return np.nan
-    if t_c < 26.7:
-        return round(float(t_c), 1)
-    t = t_c * 9.0 / 5.0 + 32.0
-    hi = (
-        -42.379
-        + 2.04901523 * t
-        + 10.14333127 * rh
-        - 0.22475541 * t * rh
-        - 0.00683783 * (t ** 2)
-        - 0.05481717 * (rh ** 2)
-        + 0.00122874 * (t ** 2) * rh
-        + 0.00085282 * t * (rh ** 2)
-        - 0.00000199 * (t ** 2) * (rh ** 2)
-    )
-    if rh < 13 and 80 <= t <= 112:
-        adj = ((13 - rh) / 4) * math.sqrt(max(0, (17 - abs(t - 95)) / 17))
-        hi -= adj
-    elif rh > 85 and 80 <= t <= 87:
-        adj = ((rh - 85) / 10) * ((87 - t) / 5)
-        hi += adj
-    hi_c = (hi - 32.0) * 5.0 / 9.0
-    return round(float(hi_c), 1)
-
-
-def calculate_wbgt(t_c, rh, wind_speed, solar_rad=800.0):
-    if pd.isna(t_c) or pd.isna(rh):
-        return np.nan
-    e = (rh / 100.0) * 6.105 * math.exp((17.27 * t_c) / (237.7 + t_c))
-    wbgt_shade = 0.567 * t_c + 0.393 * e + 3.94
-    v = max(float(wind_speed if not pd.isna(wind_speed) else 1.0), 0.5)
-    solar_adj = (solar_rad / 800.0) * 2.2 - (v - 1.0) * 0.4
-    return round(float(wbgt_shade + max(-1.0, solar_adj)), 1)
-
-
-def calculate_composite_hazard(hi, wbgt, utci_val):
-    if pd.isna(hi) or pd.isna(wbgt) or pd.isna(utci_val):
-        return np.nan
-    norm_hi = min(100.0, max(0.0, (hi - 20.0) / 30.0 * 100.0))
-    norm_wbgt = min(100.0, max(0.0, (wbgt - 18.0) / 22.0 * 100.0))
-    norm_utci = min(100.0, max(0.0, (utci_val - 20.0) / 30.0 * 100.0))
-    hazard = 0.35 * norm_hi + 0.40 * norm_wbgt + 0.25 * norm_utci
-    return round(float(hazard), 1)
-
-
-def utci_stress_category(value):
-    if pd.isna(value):
-        return "No data"
-    if value > 46:
-        return "Extreme heat stress"
-    if value > 38:
-        return "Very strong heat stress"
-    if value > 32:
-        return "Strong heat stress"
-    if value > 26:
-        return "Moderate heat stress"
-    if value > 9:
-        return "No thermal stress"
-    if value > 0:
-        return "Slight cold stress"
-    if value > -13:
-        return "Moderate cold stress"
-    if value > -27:
-        return "Strong cold stress"
-    return "Extreme cold stress"
-
-
-def calculate_f_utci(val):
-    if pd.isna(val) or val <= 26:
-        return 0.05
-    if val <= 32:
-        return 0.05 + 0.02 * (val - 26)
-    if val <= 38:
-        return 0.17 + 0.04 * (val - 32)
-    if val <= 46:
-        return 0.41 + 0.06 * (val - 38)
-    return 0.89 + 0.08 * (val - 46)
-
-
-DEMO_WEIGHTS = {
-    "Elderly (60+ yrs)": 1.8,
-    "Adults (18-59 yrs)": 1.0,
-    "Children (0-5 yrs)": 1.3,
-}
-
-
-def enrich_derived_columns(dataframe):
-    for d in range(4):
-        hi_list, wbgt_list, hazard_list = [], [], []
-        t_vals = dataframe[f"Dry Bulb Temp_d{d}"].tolist()
-        rh_vals = dataframe[f"Relative Humidity_d{d}"].tolist()
-        w_vals = dataframe[f"Wind Speed_d{d}"].tolist()
-        u_vals = dataframe[f"UTCI_d{d}"].tolist()
-
-        for t_i, rh_i, w_i, u_i in zip(t_vals, rh_vals, w_vals, u_vals):
-            hi_val = calculate_heat_index(t_i, rh_i)
-            wbgt_val = calculate_wbgt(t_i, rh_i, w_i)
-            haz_val = calculate_composite_hazard(hi_val, wbgt_val, u_i)
-            hi_list.append(hi_val)
-            wbgt_list.append(wbgt_val)
-            hazard_list.append(haz_val)
-
-        dataframe[f"Heat Index_d{d}"] = hi_list
-        dataframe[f"WBGT_d{d}"] = wbgt_list
-        dataframe[f"Composite Hazard_d{d}"] = hazard_list
-
-        dataframe[f"Stress Category_d{d}"] = dataframe[f"UTCI_d{d}"].apply(
-            utci_stress_category
-        )
-        f_vals = dataframe[f"UTCI_d{d}"].apply(calculate_f_utci)
-        for demo, weight in DEMO_WEIGHTS.items():
-            dataframe[f"Mortality_{demo}_d{d}"] = (
-                f_vals * weight * 50
-            ).round(1).clip(upper=100.0)
-    return dataframe
-
-
-df = fill_synthetic_weather(df)
-df = enrich_derived_columns(df)
-
-MEASUREMENTS = {
-    "AI Heat Vulnerability Index (0-100)": "AI HVI",
-    "Composite Thermal Hazard (0-100)": "Composite Hazard",
-    "UTCI (deg C)": "UTCI",
-    "ISO 7243 WBGT (deg C)": "WBGT",
-    "NOAA Heat Index (deg C)": "Heat Index",
-    "Dry Bulb Temp (deg C)": "Dry Bulb Temp",
-    "Mean Radiant Temp (deg C)": "Mean Radiant Temp",
-    "Wind Speed (m/s)": "Wind Speed",
-    "Relative Humidity (%)": "Relative Humidity",
-}
-DEFAULT_SLIDER_BOUNDS = {
-    "AI Heat Vulnerability Index (0-100)": [0, 100],
-    "Composite Thermal Hazard (0-100)": [0, 100],
-    "UTCI (deg C)": [15, 45],
-    "ISO 7243 WBGT (deg C)": [15, 42],
-    "NOAA Heat Index (deg C)": [15, 50],
-    "Dry Bulb Temp (deg C)": [10, 45],
-    "Mean Radiant Temp (deg C)": [10, 45],
-    "Wind Speed (m/s)": [0, 10],
-    "Relative Humidity (%)": [0, 100],
-}
-states_list = sorted(df["State"].unique().tolist())
-if "AHMEDABAD_WARDS" in ward_dfs:
-    states_list.append("Municipal Wards: Ahmedabad (48 Wards)")
-if "BANGALORE_WARDS" in ward_dfs:
-    states_list.append("Municipal Wards: Bengaluru (243 Wards)")
 
 combined_df_list = [df]
 for w_key, w_df in ward_dfs.items():
@@ -482,11 +137,18 @@ for d_idx in range(4):
 
 df = full_df
 
+states_list = sorted([s for s in df["State"].unique().tolist() if s != "Municipal Wards"])
+if "AHMEDABAD_WARDS" in ward_dfs:
+    states_list.append("Municipal Wards: Ahmedabad (48 Wards)")
+if "BANGALORE_WARDS" in ward_dfs:
+    states_list.append("Municipal Wards: Bengaluru (243 Wards)")
+
 district_options = [
     {"label": f"{r['District']} ({r['State']})", "value": r["join_key"]}
     for _, r in df.iterrows()
 ]
 
+# Background Weather Refresh Synchronization
 REFRESH_INTERVAL_SEC = int(os.environ.get("WEATHER_REFRESH_HOURS", "3")) * 3600
 _weather_ready = False
 _weather_fetching = False
@@ -510,7 +172,7 @@ def _run_one_weather_fetch(force=False):
     try:
         working = df.copy()
 
-        if not force and _load_weather_cache(working):
+        if not force and load_weather_cache(working, WEATHER_CACHE_FILE, CACHE_MAX_AGE_HOURS):
             working = enrich_derived_columns(working)
             for d_idx in range(4):
                 try:
@@ -526,7 +188,7 @@ def _run_one_weather_fetch(force=False):
             )
             return True
 
-        updated = fetch_multi_day_weather(working)
+        updated = fetch_multi_day_weather(working, FETCH_MAX_SECONDS)
         updated = enrich_derived_columns(updated)
         for d_idx in range(4):
             try:
@@ -537,7 +199,7 @@ def _run_one_weather_fetch(force=False):
         df = updated
         aborted = bool(getattr(updated, "attrs", {}).get("weather_aborted", False))
         n_ok = int(getattr(updated, "attrs", {}).get("weather_ok_locations", 0) or 0)
-        _save_weather_cache(df)
+        save_weather_cache(df, WEATHER_CACHE_FILE)
         _weather_ready = True
         _last_weather_update = datetime.now(timezone.utc)
         if aborted or n_ok < max(1, len(df) // 4):
@@ -548,7 +210,7 @@ def _run_one_weather_fetch(force=False):
     except Exception as e:
         _wlog(f"[weather] Fetch failed: {e}")
         working = df.copy()
-        if _load_weather_cache(working, max_age_hours=72):
+        if load_weather_cache(working, WEATHER_CACHE_FILE, max_age_hours=72):
             working = enrich_derived_columns(working)
             for d_idx in range(4):
                 try:
@@ -731,7 +393,7 @@ app.layout = dbc.Container([
     dcc.Interval(id="status-poll-interval", interval=12 * 1000, n_intervals=0),
     dcc.Store(id="data-version", data="init"),
 
-    # --- HEADER & CONTROLS BANNER ---
+    # Header Controls Banner
     dbc.Row([
         dbc.Col([
             html.Div([
@@ -764,7 +426,7 @@ app.layout = dbc.Container([
     ], className="brand-header-banner p-4 my-3 align-items-center"),
     html.Div(id="update-feedback", className="small text-muted mb-2"),
 
-    # --- ALERT DISPATCH MODAL ---
+    # Automated Emergency Heat Advisory Modal
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("Automated Emergency Heat Advisory Gateway")),
         dbc.ModalBody([
@@ -821,7 +483,7 @@ app.layout = dbc.Container([
         ])
     ], id="alert-modal", is_open=False, size="lg"),
 
-    # --- FORECAST HORIZON SELECTOR & KPIS ---
+    # Forecast Horizon Selector & KPI Header Card
     dbc.Card([
         dbc.CardBody([
             dbc.Row([
@@ -845,7 +507,7 @@ app.layout = dbc.Container([
         ])
     ], className="mb-4 shadow-sm border-0"),
 
-    # --- SECTION 1: MAP & INSPECTOR ---
+    # Section 1: Biometeorological & Thermal Comfort Layer
     dbc.Row([
         dbc.Col([
             dbc.Card([
@@ -883,7 +545,7 @@ app.layout = dbc.Container([
         ], lg=4)
     ], className="mb-4"),
 
-    # --- SECTION 2: MORTALITY RISK INDEX MAP ---
+    # Section 2: Demographic Mortality Risk Mapping
     dbc.Card([
         dbc.CardHeader(
             dbc.Row([
@@ -920,7 +582,7 @@ app.layout = dbc.Container([
         ])
     ], className="shadow-sm border-0 mb-4"),
 
-    # --- SECTION 3: POLICY SIMULATOR ---
+    # Section 3: Policy & Microclimate Mitigation Simulator
     dbc.Card([
         dbc.CardHeader(
             html.Div([
@@ -971,7 +633,7 @@ app.layout = dbc.Container([
         ])
     ], className="shadow-sm border-0 mb-4"),
 
-    # --- SECTION 4: AI HEAT VULNERABILITY ENGINE ---
+    # Section 4: AI Heat Vulnerability Engine
     dbc.Card([
         dbc.CardHeader(
             html.Div([
@@ -997,7 +659,7 @@ app.layout = dbc.Container([
 
 
 # ==============================================================================
-# CALLBACKS
+# CALLBACK LOGIC
 # ==============================================================================
 
 @callback(
