@@ -1347,17 +1347,29 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
 
-    map_style = "carto-darkmatter" if dark_mode else "carto-positron"
-    template = "plotly_dark" if dark_mode else "plotly_white"
-
-    fig = px.choropleth(
-        data_frame=filtered_df, color=target_col, range_color=r_use,
+    fig = px.choropleth_map(
+        data_frame=filtered_df,
+        color=target_col,
+        range_color=r_use,
         geojson=active_geojson,
-        featureidkey="properties.join_key", locations="join_key",
+        featureidkey="properties.join_key",
+        locations="join_key",
+        map_style=map_style,
+        center={"lat": center_lat, "lon": center_lon},
+        zoom=map_zoom,
+        opacity=0.75,
     )
-    fig.update_geos(fitbounds="locations", visible=False, bgcolor="rgba(0,0,0,0)")
-    fig.update_traces(marker_line_width=0.3, marker_line_color="#334155" if dark_mode else "#cbd5e1")
-    fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=550, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig.update_traces(
+        marker_line_width=0.4,
+        marker_line_color="#1e293b" if dark_mode else "#cbd5e1"
+    )
+    fig.update_layout(
+        template=template,
+        margin={"r": 0, "t": 0, "l": 0, "b": 0},
+        height=550,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
     return fig
 
 @callback(
@@ -1402,18 +1414,31 @@ def update_mortality_map(demo_class, selected_state, horizon, mortality_range, d
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
 
-    map_style = "carto-darkmatter" if dark_mode else "carto-positron"
-    template = "plotly_dark" if dark_mode else "plotly_white"
-
-    fig = px.choropleth(
-        data_frame=filtered_df, color=target_col, range_color=r_use,
-        geojson=active_geojson, color_continuous_scale="Reds",
-        featureidkey="properties.join_key", locations="join_key",
+    fig = px.choropleth_map(
+        data_frame=filtered_df,
+        color=target_col,
+        range_color=r_use,
+        geojson=active_geojson,
+        color_continuous_scale="Reds",
+        featureidkey="properties.join_key",
+        locations="join_key",
+        map_style=map_style,
+        center={"lat": center_lat, "lon": center_lon},
+        zoom=map_zoom,
+        opacity=0.75,
         labels={target_col: "Mortality Risk Index"}
     )
-    fig.update_geos(fitbounds="locations", visible=False, bgcolor="rgba(0,0,0,0)")
-    fig.update_traces(marker_line_width=0.3, marker_line_color="#7f1d1d" if dark_mode else "#fca5a5")
-    fig.update_layout(template=template, margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=500, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig.update_traces(
+        marker_line_width=0.4,
+        marker_line_color="#7f1d1d" if dark_mode else "#fca5a5"
+    )
+    fig.update_layout(
+        template=template,
+        margin={"r": 0, "t": 0, "l": 0, "b": 0},
+        height=500,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
     return fig
 
 @callback(Output('district-search', 'value'), Input('district-map', 'clickData'))
