@@ -1128,9 +1128,16 @@ def update_slider_limits(measurement_chosen, horizon, selected_state):
     if sub_df.empty:
         sub_df = df
 
-    min_val, max_val = float(sub_df[target_col].min()), float(sub_df[target_col].max())
-    p_min, p_max = float(np.floor(min_val)), float(np.ceil(max_val))
-    if p_min == p_max: p_max += 1.0
+    valid_vals = sub_df[target_col].dropna()
+    if valid_vals.empty:
+        p_min, p_max = 0.0, 100.0
+    else:
+        min_val, max_val = float(valid_vals.min()), float(valid_vals.max())
+        p_min, p_max = float(np.floor(min_val)), float(np.ceil(max_val))
+
+    if p_min == p_max:
+        p_max += 1.0
+
     ticks = np.linspace(p_min, p_max, 5)
     marks = {int(t) if t.is_integer() else round(t, 1): f"{int(t) if t.is_integer() else round(t, 1)}" for t in ticks}
     return p_min, p_max, [p_min, p_max], marks
@@ -1138,32 +1145,49 @@ def update_slider_limits(measurement_chosen, horizon, selected_state):
 @callback(
     Output('district-map', 'figure'),
     Input('measurements', 'value'), Input('state-filter', 'value'),
+    Input('district-search', 'value'),
     Input('color-range-slider', 'value'), Input('forecast-horizon', 'value'),
     Input('theme-switch', 'value'),
     Input('data-version', 'data'),
 )
-def update_thermal_map(measurement_chosen, selected_state, color_range, horizon, dark_mode, _version):
+def update_thermal_map(measurement_chosen, selected_state, searched_district, color_range, horizon, dark_mode, _version):
     target_col = f"{MEASUREMENTS[measurement_chosen]}_d{horizon}"
-    r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS[measurement_chosen]
 
-    if "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
+    if searched_district and searched_district in df["join_key"].values:
+        d_row = df[df["join_key"] == searched_district].iloc[0]
+        if searched_district.startswith("AHMEDABAD_WARDS|") and "AHMEDABAD_WARDS" in ward_geojsons:
+            active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
+            filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
+            center_lat, center_lon, map_zoom = float(d_row["lat"]), float(d_row["lon"]), 11.5
+        elif searched_district.startswith("BANGALORE_WARDS|") and "BANGALORE_WARDS" in ward_geojsons:
+            active_geojson = ward_geojsons["BANGALORE_WARDS"]
+            filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
+            center_lat, center_lon, map_zoom = float(d_row["lat"]), float(d_row["lon"]), 11.2
+        else:
+            active_geojson = district_geojson
+            st = d_row["State"]
+            filtered_df = df[df["State"] == st] if st != "Municipal Wards" else df[~df["State"].isin(["Municipal Wards"])]
+            center_lat, center_lon, map_zoom = float(d_row["lat"]), float(d_row["lon"]), 7.0
+    elif "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
         active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
         filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
-        center_lat, center_lon, map_zoom = 23.0225, 72.5714, 10.5
+        center_lat, center_lon, map_zoom = 23.0225, 72.5714, 9.8
     elif "Bengaluru" in selected_state and "BANGALORE_WARDS" in ward_geojsons:
         active_geojson = ward_geojsons["BANGALORE_WARDS"]
         filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
-        center_lat, center_lon, map_zoom = 12.9716, 77.5946, 10.2
+        center_lat, center_lon, map_zoom = 12.9716, 77.5946, 9.5
     elif selected_state == "ALL":
         active_geojson = district_geojson
         filtered_df = df[~df["State"].isin(["Municipal Wards"])]
-        center_lat, center_lon, map_zoom = 22.5, 80.0, 3.4
+        center_lat, center_lon, map_zoom = 22.5, 80.0, 3.6
     else:
         active_geojson = district_geojson
         filtered_df = df[df['State'] == selected_state]
         center_lat = float(filtered_df["lat"].mean()) if not filtered_df.empty else 22.5
         center_lon = float(filtered_df["lon"].mean()) if not filtered_df.empty else 80.0
-        map_zoom = 5.5
+        map_zoom = 5.2
+
+    r_use = color_range if color_range else DEFAULT_SLIDER_BOUNDS.get(measurement_chosen, [15, 45])
 
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
@@ -1206,31 +1230,47 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
 @callback(
     Output('mortality-map', 'figure'),
     Input('demographic-class', 'value'), Input('state-filter', 'value'),
+    Input('district-search', 'value'),
     Input('forecast-horizon', 'value'), Input('mortality-range-slider', 'value'),
     Input('theme-switch', 'value'),
     Input('data-version', 'data'),
 )
-def update_mortality_map(demo_class, selected_state, horizon, mortality_range, dark_mode, _version):
+def update_mortality_map(demo_class, selected_state, searched_district, horizon, mortality_range, dark_mode, _version):
     target_col = f"Mortality_{demo_class}_d{horizon}"
 
-    if "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
+    if searched_district and searched_district in df["join_key"].values:
+        d_row = df[df["join_key"] == searched_district].iloc[0]
+        if searched_district.startswith("AHMEDABAD_WARDS|") and "AHMEDABAD_WARDS" in ward_geojsons:
+            active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
+            filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
+            center_lat, center_lon, map_zoom = float(d_row["lat"]), float(d_row["lon"]), 11.5
+        elif searched_district.startswith("BANGALORE_WARDS|") and "BANGALORE_WARDS" in ward_geojsons:
+            active_geojson = ward_geojsons["BANGALORE_WARDS"]
+            filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
+            center_lat, center_lon, map_zoom = float(d_row["lat"]), float(d_row["lon"]), 11.2
+        else:
+            active_geojson = district_geojson
+            st = d_row["State"]
+            filtered_df = df[df["State"] == st] if st != "Municipal Wards" else df[~df["State"].isin(["Municipal Wards"])]
+            center_lat, center_lon, map_zoom = float(d_row["lat"]), float(d_row["lon"]), 7.0
+    elif "Ahmedabad" in selected_state and "AHMEDABAD_WARDS" in ward_geojsons:
         active_geojson = ward_geojsons["AHMEDABAD_WARDS"]
         filtered_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
-        center_lat, center_lon, map_zoom = 23.0225, 72.5714, 10.5
+        center_lat, center_lon, map_zoom = 23.0225, 72.5714, 9.8
     elif "Bengaluru" in selected_state and "BANGALORE_WARDS" in ward_geojsons:
         active_geojson = ward_geojsons["BANGALORE_WARDS"]
         filtered_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
-        center_lat, center_lon, map_zoom = 12.9716, 77.5946, 10.2
+        center_lat, center_lon, map_zoom = 12.9716, 77.5946, 9.5
     elif selected_state == "ALL":
         active_geojson = district_geojson
         filtered_df = df[~df["State"].isin(["Municipal Wards"])]
-        center_lat, center_lon, map_zoom = 22.5, 80.0, 3.4
+        center_lat, center_lon, map_zoom = 22.5, 80.0, 3.6
     else:
         active_geojson = district_geojson
         filtered_df = df[df['State'] == selected_state]
         center_lat = float(filtered_df["lat"].mean()) if not filtered_df.empty else 22.5
         center_lon = float(filtered_df["lon"].mean()) if not filtered_df.empty else 80.0
-        map_zoom = 5.5
+        map_zoom = 5.2
 
     if mortality_range:
         filtered_df = filtered_df[
