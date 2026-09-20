@@ -19,9 +19,11 @@ from src.ml_engine import get_hvi_predictions_and_features
 # ==============================================================================
 # DATA INGESTION & PROCESSING
 # ==============================================================================
-CENTROIDS_FILE = os.environ.get("CENTROIDS_FILE", "data/geo/district_centroids.xlsx")
-GEOJSON_FILE = os.environ.get("GEOJSON_FILE", "data/geo/India-Districts-slim.json")
-SPATIAL_FEATURES_FILE = os.environ.get("SPATIAL_FEATURES_FILE", "data/spatial_features.csv")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CENTROIDS_FILE = os.environ.get("CENTROIDS_FILE", os.path.join(BASE_DIR, "data/geo/district_centroids.xlsx"))
+GEOJSON_FILE = os.environ.get("GEOJSON_FILE", os.path.join(BASE_DIR, "data/geo/India-Districts-slim.json"))
+SPATIAL_FEATURES_FILE = os.environ.get("SPATIAL_FEATURES_FILE", os.path.join(BASE_DIR, "data/spatial_features.csv"))
 
 df = pd.read_excel(CENTROIDS_FILE)
 required = {"join_key", "District", "State", "lat", "lon"}
@@ -39,8 +41,8 @@ for feature in district_geojson["features"]:
 
 # Load Municipal Ward GeoJSONs lazily to maintain low memory footprint (<150 MB)
 WARD_FILES = {
-    "AHMEDABAD_WARDS": "data/municipal_wards/ahmedabad_wards.geojson",
-    "BANGALORE_WARDS": "data/municipal_wards/bangalore_wards.geojson",
+    "AHMEDABAD_WARDS": os.environ.get("AHMEDABAD_WARDS_FILE", os.path.join(BASE_DIR, "data/municipal_wards/ahmedabad_wards.geojson")),
+    "BANGALORE_WARDS": os.environ.get("BANGALORE_WARDS_FILE", os.path.join(BASE_DIR, "data/municipal_wards/bangalore_wards.geojson")),
 }
 ward_geojsons = {}
 ward_dfs = {}
@@ -90,7 +92,7 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 BATCH_SIZE = 40
 BATCH_PAUSE_SEC = 1.5
 FETCH_MAX_SECONDS = int(os.environ.get("FETCH_MAX_SECONDS", "90"))
-WEATHER_CACHE_FILE = os.environ.get("WEATHER_CACHE_FILE", "weather_cache.pkl")
+WEATHER_CACHE_FILE = os.environ.get("WEATHER_CACHE_FILE", os.path.join(BASE_DIR, "weather_cache.pkl"))
 CACHE_MAX_AGE_HOURS = float(os.environ.get("CACHE_MAX_AGE_HOURS", "6"))
 
 
