@@ -2,4 +2,3 @@ __pycache__/
 *.pyc
 *.pkl
 .pytest_cache/
-PROJECT_MASTER_DOSSIER.md
