@@ -1110,18 +1110,30 @@ def update_kpis(horizon, dark_mode, _version):
 @callback(
     Output('color-range-slider', 'min'), Output('color-range-slider', 'max'),
     Output('color-range-slider', 'value'), Output('color-range-slider', 'marks'),
-    Input('measurements', 'value'), Input('forecast-horizon', 'value')
+    Input('measurements', 'value'), Input('forecast-horizon', 'value'),
+    Input('state-filter', 'value')
 )
-def update_slider_limits(measurement_chosen, horizon):
+def update_slider_limits(measurement_chosen, horizon, selected_state):
     col_prefix = MEASUREMENTS[measurement_chosen]
     target_col = f"{col_prefix}_d{horizon}"
-    min_val, max_val = float(df[target_col].min()), float(df[target_col].max())
+    if "Ahmedabad" in selected_state:
+        sub_df = df[df["join_key"].str.startswith("AHMEDABAD_WARDS|")]
+    elif "Bengaluru" in selected_state:
+        sub_df = df[df["join_key"].str.startswith("BANGALORE_WARDS|")]
+    elif selected_state == "ALL":
+        sub_df = df[~df["State"].isin(["Municipal Wards"])]
+    else:
+        sub_df = df[df['State'] == selected_state]
+
+    if sub_df.empty:
+        sub_df = df
+
+    min_val, max_val = float(sub_df[target_col].min()), float(sub_df[target_col].max())
     p_min, p_max = float(np.floor(min_val)), float(np.ceil(max_val))
     if p_min == p_max: p_max += 1.0
     ticks = np.linspace(p_min, p_max, 5)
     marks = {int(t) if t.is_integer() else round(t, 1): f"{int(t) if t.is_integer() else round(t, 1)}" for t in ticks}
-    default_range = DEFAULT_SLIDER_BOUNDS.get(measurement_chosen, [p_min, p_max])
-    return p_min, p_max, default_range, marks
+    return p_min, p_max, [p_min, p_max], marks
 
 @callback(
     Output('district-map', 'figure'),
@@ -1156,17 +1168,27 @@ def update_thermal_map(measurement_chosen, selected_state, color_range, horizon,
     map_style = "carto-darkmatter" if dark_mode else "carto-positron"
     template = "plotly_dark" if dark_mode else "plotly_white"
 
+    if not filtered_df.empty and target_col in filtered_df.columns:
+        c_min = float(filtered_df[target_col].min())
+        c_max = float(filtered_df[target_col].max())
+        if not color_range or color_range[0] >= c_max or color_range[1] <= c_min:
+            r_use = [math.floor(c_min), math.ceil(c_max)]
+            if r_use[0] == r_use[1]:
+                r_use[1] += 1.0
+
     fig = px.choropleth_map(
         data_frame=filtered_df,
         color=target_col,
         range_color=r_use,
         geojson=active_geojson,
+        color_continuous_scale="YlOrRd",
         featureidkey="properties.join_key",
         locations="join_key",
         map_style=map_style,
         center={"lat": center_lat, "lon": center_lon},
         zoom=map_zoom,
         opacity=0.75,
+        labels={target_col: measurement_chosen},
     )
     fig.update_traces(
         marker_line_width=0.4,
