@@ -6,9 +6,7 @@ numpy
 requests
 pythermalcomfort
 gunicorn
-openmeteo-requests
-requests-cache
-retry-requests
 openpyxl
 scikit-learn
 joblib
+psutil
