@@ -88,8 +88,13 @@ utci_response = utci(
 The **Wet Bulb Globe Temperature (WBGT)** is the standard index mandated by the International Organization for Standardization (**ISO 7243**) and OSHA for assessing thermal workplace safety in outdoor physical labor.
 
 In direct sunlight, WBGT synthesizes three temperature components:
-$$\text{WBGT}_{\text{outdoor}} = 0.7 \cdot T_{nw} + 0.2 \cdot T_g + 0.1 \cdot T_{db}$$
+
+$$
+\text{WBGT}_{\text{outdoor}} = 0.7 \cdot T_{nw} + 0.2 \cdot T_g + 0.1 \cdot T_{db}
+$$
+
 where:
+
 * $T_{nw}$ is the Natural Wet-Bulb Temperature (reflecting evaporative cooling and humidity)
 * $T_g$ is the Black Globe Temperature (measuring direct solar radiation absorption)
 * $T_{db}$ is the Dry-Bulb Air Temperature
