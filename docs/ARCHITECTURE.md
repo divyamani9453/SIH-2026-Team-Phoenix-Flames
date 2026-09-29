@@ -66,10 +66,21 @@ $$\text{UTCI} = f(T_{\text{db}}, T_{\text{mrt}}, v_{10\text{m}}, \text{RH})$$
 
 ### 2.2 ISO 7243 Outdoor Wet Bulb Globe Temperature (WBGT)
 Derived via Australian Bureau of Meteorology / Liljegren outdoor approximation:
-$$e = \frac{\text{RH}}{100} \cdot 6.105 \cdot \exp\left(\frac{17.27 \cdot T_{\text{db}}}{237.7 + T_{\text{db}}}\right)$$
-$$\text{WBGT}_{\text{shade}} = 0.567 \cdot T_{\text{db}} + 0.393 \cdot e + 3.94$$
-$$\text{WBGT}_{\text{outdoor}} = \text{WBGT}_{\text{shade}} + \max\left(-1.0, \frac{S}{800} \cdot 2.2 - (v - 1.0) \cdot 0.4\right)$$
-where $S = 800\,\text{W/m}^2$ represents standard solar irradiance.
+
+$$
+e = \frac{\text{RH}}{100} \cdot 6.105 \cdot \exp\left(\frac{17.27 \cdot T_{\text{db}}}{237.7 + T_{\text{db}}}\right)
+$$
+
+$$
+\text{WBGT}_{\text{shade}} = 0.567 \cdot T_{\text{db}} + 0.393 \cdot e + 3.94
+$$
+
+$$
+\text{WBGT}_{\text{outdoor}} = \text{WBGT}_{\text{shade}} + \max\left(-1.0, \frac{S}{800} \cdot 2.2 - (v - 1.0) \cdot 0.4\right)
+$$
+
+where $S = 800,\text{W/m}^2$ represents standard solar irradiance.
+
 
 ### 2.3 NOAA Rothfusz Heat Index (HI)
 $$\text{HI} = -42.379 + 2.04901523 T + 10.14333127 R - 0.22475541 T R - 0.00683783 T^2 - 0.05481717 R^2 + 0.00122874 T^2 R + 0.00085282 T R^2 - 0.00000199 T^2 R^2$$
